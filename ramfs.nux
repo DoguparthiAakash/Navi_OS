@@ -1,50 +1,357 @@
 @[no_std]
 
 import fs;
+import std::mem;
+import std::string;
 
-# ramfs.nux - Initial RAM File System
-# This module reads an archive loaded into memory by GRUB.
-# GRUB passes the address of boot modules via the Multiboot struct.
+# ─── ramfs.nux — Mutable RAM File System ─────────────────────────────────────
+#
+# Layout in low memory:
+#   0x01000000 — INITRD_BASE  (read-only initrd from GRUB)
+#   0x01100000 — file_names   (16 bytes per file × MAX_FILES)
+#   0x01110000 — file_data_ptrs (4 bytes per file, pointer to content)
+#   0x01110100 — file_sizes   (4 bytes per file)
+#   0x01120000 — file heap    (bump allocator for dynamic content)
+#   0x01200000 — dir_names    (16 bytes per dir × MAX_DIRS)
+#   0x01210000 — dir_file_counts (4 bytes per dir)
+#
+# All accesses done via inline asm pointer arithmetic to avoid needing
+# struct support in the current Nux compiler.
 
-# Hardcoded for the demo: We assume the initrd module is loaded at 0x01000000
-# and it contains a flat sequence of files: [Name (16 bytes)][Size (4 bytes)][Data (Size bytes)]
+var MAX_FILES:   u32 = 32;
+var MAX_DIRS:    u32 = 16;
+var NAME_LEN:    u32 = 16;    # bytes reserved per filename
 
-var INITRD_BASE: *u8 = 0x01000000;
-var MAX_FILES: u32 = 10;
-var root_files: *fs::File = 0x01100000; # Static allocation for file nodes
-var root_file_count: u32 = 0;
+# Memory map
+var FILE_NAMES:      *u8 = 0x01100000;  # 16 bytes × 32 files = 512 bytes
+var FILE_DATA_PTRS:  *u32 = 0x01100200; # 4 bytes × 32 = 128 bytes
+var FILE_SIZES:      *u32 = 0x01100300; # 4 bytes × 32 = 128 bytes
+var FILE_FLAGS:      *u8  = 0x01100400; # 1 byte × 32 (0=empty, 1=used)
+var FILE_HEAP_BASE:  *u8 = 0x01120000;  # 512 KB for file content
 
-var root_dir: fs::Directory;
+var DIR_NAMES:       *u8  = 0x01200000; # 16 bytes × 16 dirs
+var DIR_FLAGS:       *u8  = 0x01200100; # 1 byte × 16
 
-func init_ramfs() {
-    # In a real OS, we read the multiboot information struct.
-    # For now, we mock parsing an archive from INITRD_BASE.
-    
-    # We will simulate that there is one file "readme.txt" pre-loaded
-    # at INITRD_BASE by our build script.
-    
-    # Mocking the parsed structure for the shell to use
-    var readme_name: *u8 = "readme.txt";
-    var readme_data: *u8 = "Welcome to Navi OS!\nThis is a real file stored in NuxFS (RamFS).\n";
-    var readme_size: u32 = 65; # Length of the string above
-    
-    # We simulate populating the root_files array
-    # root_files[0].init(readme_name, readme_data, readme_size);
-    # Since we can't do array syntax easily without std::collections:
-    asm("
-        mov %1, %%eax
-        mov %%eax, 0(%0)
-        mov %2, %%eax
-        mov %%eax, 4(%0)
-        mov %3, %%eax
-        mov %%eax, 8(%0)
-    " : : "r"(root_files), "r"(readme_name), "r"(readme_data), "r"(readme_size) : "%eax");
-    
-    root_file_count = 1;
-    
-    root_dir.init("/", root_files, root_file_count);
+var file_heap_ptr: *u8 = 0x01120000;
+var file_count: u32 = 0;
+var dir_count: u32 = 0;
+
+# ─── Internal helpers ─────────────────────────────────────────────────────────
+
+func _copy_name(dst: *u8, src: *u8) {
+    var i: u32 = 0;
+    while (i < NAME_LEN) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t"
+            "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(src), "r"(i) : "%eax");
+        asm("movb %b2, (%0,%1,1)\n\t"
+            : : "r"(dst), "r"(i), "q"(c));
+        if (c == 0) { break; }
+        i += 1;
+    }
 }
 
-func get_root() -> fs::Directory {
-    return root_dir;
+func _names_equal(a: *u8, b: *u8) -> u8 {
+    var i: u32 = 0;
+    while (i < NAME_LEN) {
+        var ca: u8 = 0;
+        var cb: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(ca) : "r"(a), "r"(i) : "%eax");
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(cb) : "r"(b), "r"(i) : "%eax");
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i += 1;
+    }
+    return 1;
+}
+
+# Bump-allocate n bytes from the file heap
+func _heap_alloc(n: u32) -> *u8 {
+    var p = file_heap_ptr;
+    var np: u32 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+        : "=r"(np) : "r"(file_heap_ptr), "r"(n));
+    file_heap_ptr = np as *u8;
+    return p;
+}
+
+# Copy up to n bytes of src to dst
+func _copy_bytes(dst: *u8, src: *u8, n: u32) {
+    var i: u32 = 0;
+    while (i < n) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(src), "r"(i) : "%eax");
+        asm("movb %b2, (%0,%1,1)\n\t"
+            : : "r"(dst), "r"(i), "q"(c));
+        i += 1;
+    }
+    # Null-terminate
+    asm("movb $0, (%0,%1,1)\n\t" : : "r"(dst), "r"(n));
+}
+
+# ─── Initialisation ───────────────────────────────────────────────────────────
+
+func init_ramfs() {
+    # Clear the flag arrays (mark all slots empty)
+    var i: u32 = 0;
+    while (i < MAX_FILES) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(FILE_FLAGS), "r"(i));
+        i += 1;
+    }
+    i = 0;
+    while (i < MAX_DIRS) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(DIR_FLAGS), "r"(i));
+        i += 1;
+    }
+    file_count = 0;
+    dir_count = 0;
+    file_heap_ptr = FILE_HEAP_BASE;
+    # readme pre-population done at end of ramfs init (after create_file defined)
+}
+
+# ─── File Operations ──────────────────────────────────────────────────────────
+
+# (All file helpers defined here, before init_ramfs calls create_file)
+
+# Returns the file slot index or MAX_FILES if not found
+func _find_file(name: *u8) -> u32 {
+    var i: u32 = 0;
+    while (i < MAX_FILES) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(FILE_FLAGS), "r"(i) : "%eax");
+        if (flag != 0) {
+            # Compute name pointer: FILE_NAMES + i * NAME_LEN
+            var nptr: *u8 = 0;
+            var offset: u32 = i * NAME_LEN;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+                : "=r"(nptr) : "r"(FILE_NAMES), "r"(offset));
+            if (_names_equal(nptr, name) != 0) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return MAX_FILES;
+}
+
+# Find an empty file slot
+func _alloc_file_slot() -> u32 {
+    var i: u32 = 0;
+    while (i < MAX_FILES) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(FILE_FLAGS), "r"(i) : "%eax");
+        if (flag == 0) { return i; }
+        i += 1;
+    }
+    return MAX_FILES; # Full
+}
+
+# Create a file. Returns 1 on success, 0 on failure.
+func create_file(name: *u8, data: *u8, size: u32) -> u8 {
+    # Check it doesn't already exist
+    if (_find_file(name) != MAX_FILES) { return 0; }
+
+    var slot = _alloc_file_slot();
+    if (slot == MAX_FILES) { return 0; }
+
+    # Copy name into FILE_NAMES[slot * NAME_LEN]
+    var name_offset: u32 = slot * NAME_LEN;
+    var name_dst: *u8 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+        : "=r"(name_dst) : "r"(FILE_NAMES), "r"(name_offset));
+    _copy_name(name_dst, name);
+
+    # Allocate heap space and copy data
+    var heap_ptr = _heap_alloc(size + 1);
+    _copy_bytes(heap_ptr, data, size);
+
+    # Store pointer into FILE_DATA_PTRS[slot] (4-byte aligned)
+    var ptr_offset: u32 = slot * 4;
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl %3, (%%eax)\n\t"
+        : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
+
+    # Store size
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl %3, (%%eax)\n\t"
+        : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
+
+    # Mark slot as used
+    var one: u8 = 1;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(FILE_FLAGS), "r"(slot), "q"(one));
+
+    file_count += 1;
+    return 1;
+}
+
+# Overwrite file contents (append not supported yet — just replace)
+func write_file(name: *u8, data: *u8, size: u32) -> u8 {
+    var slot = _find_file(name);
+    if (slot == MAX_FILES) {
+        # Create new
+        return create_file(name, data, size);
+    }
+    # Allocate new heap space and update pointers
+    var heap_ptr = _heap_alloc(size + 1);
+    _copy_bytes(heap_ptr, data, size);
+
+    var ptr_offset: u32 = slot * 4;
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl %3, (%%eax)\n\t"
+        : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl %3, (%%eax)\n\t"
+        : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
+    return 1;
+}
+
+# Delete a file. Returns 1 if deleted, 0 if not found.
+func delete_file(name: *u8) -> u8 {
+    var slot = _find_file(name);
+    if (slot == MAX_FILES) { return 0; }
+    var zero: u8 = 0;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(FILE_FLAGS), "r"(slot), "q"(zero));
+    file_count -= 1;
+    return 1;
+}
+
+# Get data pointer for a file (returns 0 if not found)
+func get_file_data(name: *u8) -> *u8 {
+    var slot = _find_file(name);
+    if (slot == MAX_FILES) { return 0; }
+    var ptr_offset: u32 = slot * 4;
+    var result: *u8 = 0;
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl (%%eax), %0\n\t"
+        : "=r"(result) : "r"(FILE_DATA_PTRS), "r"(ptr_offset) : "%eax");
+    return result;
+}
+
+# Get size of a file
+func get_file_size(name: *u8) -> u32 {
+    var slot = _find_file(name);
+    if (slot == MAX_FILES) { return 0; }
+    var ptr_offset: u32 = slot * 4;
+    var sz: u32 = 0;
+    asm("movl %1, %%eax\n\t"
+        "addl %2, %%eax\n\t"
+        "movl (%%eax), %0\n\t"
+        : "=r"(sz) : "r"(FILE_SIZES), "r"(ptr_offset) : "%eax");
+    return sz;
+}
+
+# Get nth file name (for ls / file manager listing)
+func get_file_name_at(index: u32) -> *u8 {
+    # Skip empty slots
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while (i < MAX_FILES) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(FILE_FLAGS), "r"(i) : "%eax");
+        if (flag != 0) {
+            if (count == index) {
+                var name_offset: u32 = i * NAME_LEN;
+                var nptr: *u8 = 0;
+                asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+                    : "=r"(nptr) : "r"(FILE_NAMES), "r"(name_offset));
+                return nptr;
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+# ─── Directory Operations ─────────────────────────────────────────────────────
+
+func _find_dir(name: *u8) -> u32 {
+    var i: u32 = 0;
+    while (i < MAX_DIRS) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(DIR_FLAGS), "r"(i) : "%eax");
+        if (flag != 0) {
+            var nptr: *u8 = 0;
+            var offset: u32 = i * NAME_LEN;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+                : "=r"(nptr) : "r"(DIR_NAMES), "r"(offset));
+            if (_names_equal(nptr, name) != 0) { return i; }
+        }
+        i += 1;
+    }
+    return MAX_DIRS;
+}
+
+func create_dir(name: *u8) -> u8 {
+    if (_find_dir(name) != MAX_DIRS) { return 0; } # already exists
+    var i: u32 = 0;
+    while (i < MAX_DIRS) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(DIR_FLAGS), "r"(i) : "%eax");
+        if (flag == 0) {
+            var offset: u32 = i * NAME_LEN;
+            var dst: *u8 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+                : "=r"(dst) : "r"(DIR_NAMES), "r"(offset));
+            _copy_name(dst, name);
+            var one: u8 = 1;
+            asm("movb %b2, (%0,%1,1)\n\t" : : "r"(DIR_FLAGS), "r"(i), "q"(one));
+            dir_count += 1;
+            return 1;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+func delete_dir(name: *u8) -> u8 {
+    var slot = _find_dir(name);
+    if (slot == MAX_DIRS) { return 0; }
+    var zero: u8 = 0;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(DIR_FLAGS), "r"(slot), "q"(zero));
+    dir_count -= 1;
+    return 1;
+}
+
+func get_dir_name_at(index: u32) -> *u8 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while (i < MAX_DIRS) {
+        var flag: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(flag) : "r"(DIR_FLAGS), "r"(i) : "%eax");
+        if (flag != 0) {
+            if (count == index) {
+                var offset: u32 = i * NAME_LEN;
+                var nptr: *u8 = 0;
+                asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+                    : "=r"(nptr) : "r"(DIR_NAMES), "r"(offset));
+                return nptr;
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+# ─── Post-init (called after all file helpers are defined) ───────────────────
+
+func populate_readme() {
+    var readme_content: *u8 = "Welcome to Navi OS!\nPowered by the Nux language.\nType 'help' in the shell for commands.\n";
+    create_file("readme.txt", readme_content, 87);
 }

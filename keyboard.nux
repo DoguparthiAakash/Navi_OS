@@ -1,55 +1,438 @@
 @[no_std]
 
-# Basic PS/2 Keyboard polling via x86 Port I/O (Port 0x60 and 0x64)
+import std::hw;
 
+# ─── keyboard.nux — Full PS/2 Keyboard Driver ─────────────────────────────────
+#
+# Supports: full QWERTY, Shift, CapsLock, Ctrl, Alt, arrow keys, F-keys, etc.
+# Key events are returned as a u32 packed value:
+#   bits [7:0]  = ASCII char (0 if non-printable)
+#   bits [15:8] = special key code (KEY_* constants below)
+#   bits [23:16] = modifier flags (MOD_*)
 
+# ─── Modifier Flags ───────────────────────────────────────────────────────────
+var MOD_SHIFT:   u8 = 1;
+var MOD_CTRL:    u8 = 2;
+var MOD_ALT:     u8 = 4;
+var MOD_CAPS:    u8 = 8;
 
-func get_scancode() -> u8 {
-    # Port 0x64 is the command/status port.
-    # We loop until bit 0 (Output Buffer Status) is 1 (data is ready to read).
+# ─── Special Key Codes ────────────────────────────────────────────────────────
+var KEY_NONE:       u8 = 0;
+var KEY_ENTER:      u8 = 1;
+var KEY_BACKSPACE:  u8 = 2;
+var KEY_TAB:        u8 = 3;
+var KEY_ESC:        u8 = 4;
+var KEY_UP:         u8 = 5;
+var KEY_DOWN:       u8 = 6;
+var KEY_LEFT:       u8 = 7;
+var KEY_RIGHT:      u8 = 8;
+var KEY_HOME:       u8 = 9;
+var KEY_END:        u8 = 10;
+var KEY_PGUP:       u8 = 11;
+var KEY_PGDN:       u8 = 12;
+var KEY_DEL:        u8 = 13;
+var KEY_INSERT:     u8 = 14;
+var KEY_F1:         u8 = 20;
+var KEY_F2:         u8 = 21;
+var KEY_F3:         u8 = 22;
+var KEY_F4:         u8 = 23;
+var KEY_F5:         u8 = 24;
+var KEY_F6:         u8 = 25;
+var KEY_F7:         u8 = 26;
+var KEY_F8:         u8 = 27;
+var KEY_F9:         u8 = 28;
+var KEY_F10:        u8 = 29;
+var KEY_F11:        u8 = 30;
+var KEY_F12:        u8 = 31;
+
+# ─── Internal Driver State ────────────────────────────────────────────────────
+var shift_down:   u8 = 0;
+var ctrl_down:    u8 = 0;
+var alt_down:     u8 = 0;
+var caps_lock:    u8 = 0;
+var extended:     u8 = 0;    # Set when 0xE0 prefix is seen
+
+# ─── Scancode → ASCII tables ─────────────────────────────────────────────────
+# These are flat arrays at fixed low-memory addresses.
+# Layout: unshifted[128] at 0x9000, shifted[128] at 0x9080
+
+func init_keymaps() {
+    # We write the ASCII values directly into memory at known addresses.
+    # This avoids needing string literals for each character.
+
+    # Unshifted map  (0x9000 base)
+    var base: *u8 = 0x9000;
+
+    # Row: scancodes 0x00-0x0F
+    asm("movb $0,  0(%0)\n\t"   # 0x00 - none
+        "movb $27, 1(%0)\n\t"   # 0x01 - ESC
+        "movb $49, 2(%0)\n\t"   # 0x02 - '1'
+        "movb $50, 3(%0)\n\t"   # 0x03 - '2'
+        "movb $51, 4(%0)\n\t"   # 0x04 - '3'
+        "movb $52, 5(%0)\n\t"   # 0x05 - '4'
+        "movb $53, 6(%0)\n\t"   # 0x06 - '5'
+        "movb $54, 7(%0)\n\t"   # 0x07 - '6'
+        "movb $55, 8(%0)\n\t"   # 0x08 - '7'
+        "movb $56, 9(%0)\n\t"   # 0x09 - '8'
+        "movb $57, 10(%0)\n\t"  # 0x0A - '9'
+        "movb $48, 11(%0)\n\t"  # 0x0B - '0'
+        "movb $45, 12(%0)\n\t"  # 0x0C - '-'
+        "movb $61, 13(%0)\n\t"  # 0x0D - '='
+        "movb $8,  14(%0)\n\t"  # 0x0E - Backspace
+        "movb $9,  15(%0)\n\t"  # 0x0F - Tab
+        : : "r"(base));
+
+    # Row: scancodes 0x10-0x1F
+    asm("movb $113, 16(%0)\n\t"  # 0x10 - 'q'
+        "movb $119, 17(%0)\n\t"  # 0x11 - 'w'
+        "movb $101, 18(%0)\n\t"  # 0x12 - 'e'
+        "movb $114, 19(%0)\n\t"  # 0x13 - 'r'
+        "movb $116, 20(%0)\n\t"  # 0x14 - 't'
+        "movb $121, 21(%0)\n\t"  # 0x15 - 'y'
+        "movb $117, 22(%0)\n\t"  # 0x16 - 'u'
+        "movb $105, 23(%0)\n\t"  # 0x17 - 'i'
+        "movb $111, 24(%0)\n\t"  # 0x18 - 'o'
+        "movb $112, 25(%0)\n\t"  # 0x19 - 'p'
+        "movb $91,  26(%0)\n\t"  # 0x1A - '['
+        "movb $93,  27(%0)\n\t"  # 0x1B - ']'
+        "movb $10,  28(%0)\n\t"  # 0x1C - Enter
+        "movb $0,   29(%0)\n\t"  # 0x1D - Left Ctrl
+        "movb $97,  30(%0)\n\t"  # 0x1E - 'a'
+        "movb $115, 31(%0)\n\t"  # 0x1F - 's'
+        : : "r"(base));
+
+    # Row: scancodes 0x20-0x2F
+    asm("movb $100, 32(%0)\n\t"  # 0x20 - 'd'
+        "movb $102, 33(%0)\n\t"  # 0x21 - 'f'
+        "movb $103, 34(%0)\n\t"  # 0x22 - 'g'
+        "movb $104, 35(%0)\n\t"  # 0x23 - 'h'
+        "movb $106, 36(%0)\n\t"  # 0x24 - 'j'
+        "movb $107, 37(%0)\n\t"  # 0x25 - 'k'
+        "movb $108, 38(%0)\n\t"  # 0x26 - 'l'
+        "movb $59,  39(%0)\n\t"  # 0x27 - ';'
+        "movb $39,  40(%0)\n\t"  # 0x28 - '\''
+        "movb $96,  41(%0)\n\t"  # 0x29 - '`'
+        "movb $0,   42(%0)\n\t"  # 0x2A - Left Shift
+        "movb $92,  43(%0)\n\t"  # 0x2B - '\'
+        "movb $122, 44(%0)\n\t"  # 0x2C - 'z'
+        "movb $120, 45(%0)\n\t"  # 0x2D - 'x'
+        "movb $99,  46(%0)\n\t"  # 0x2E - 'c'
+        "movb $118, 47(%0)\n\t"  # 0x2F - 'v'
+        : : "r"(base));
+
+    # Row: scancodes 0x30-0x3F
+    asm("movb $98,  48(%0)\n\t"  # 0x30 - 'b'
+        "movb $110, 49(%0)\n\t"  # 0x31 - 'n'
+        "movb $109, 50(%0)\n\t"  # 0x32 - 'm'
+        "movb $44,  51(%0)\n\t"  # 0x33 - ','
+        "movb $46,  52(%0)\n\t"  # 0x34 - '.'
+        "movb $47,  53(%0)\n\t"  # 0x35 - '/'
+        "movb $0,   54(%0)\n\t"  # 0x36 - Right Shift
+        "movb $42,  55(%0)\n\t"  # 0x37 - '*' (numpad)
+        "movb $0,   56(%0)\n\t"  # 0x38 - Alt
+        "movb $32,  57(%0)\n\t"  # 0x39 - Space
+        "movb $0,   58(%0)\n\t"  # 0x3A - CapsLock
+        "movb $0,   59(%0)\n\t"  # 0x3B - F1
+        "movb $0,   60(%0)\n\t"  # 0x3C - F2
+        "movb $0,   61(%0)\n\t"  # 0x3D - F3
+        "movb $0,   62(%0)\n\t"  # 0x3E - F4
+        "movb $0,   63(%0)\n\t"  # 0x3F - F5
+        : : "r"(base));
+
+    # Row: scancodes 0x40-0x4F
+    asm("movb $0,  64(%0)\n\t"   # 0x40 - F6
+        "movb $0,  65(%0)\n\t"   # 0x41 - F7
+        "movb $0,  66(%0)\n\t"   # 0x42 - F8
+        "movb $0,  67(%0)\n\t"   # 0x43 - F9
+        "movb $0,  68(%0)\n\t"   # 0x44 - F10
+        "movb $0,  69(%0)\n\t"   # 0x45 - NumLock
+        "movb $0,  70(%0)\n\t"   # 0x46 - ScrollLock
+        "movb $55, 71(%0)\n\t"   # 0x47 - '7' numpad
+        "movb $56, 72(%0)\n\t"   # 0x48 - '8' numpad (up)
+        "movb $57, 73(%0)\n\t"   # 0x49 - '9' numpad
+        "movb $45, 74(%0)\n\t"   # 0x4A - '-' numpad
+        "movb $52, 75(%0)\n\t"   # 0x4B - '4' numpad (left)
+        "movb $53, 76(%0)\n\t"   # 0x4C - '5' numpad
+        "movb $54, 77(%0)\n\t"   # 0x4D - '6' numpad (right)
+        "movb $43, 78(%0)\n\t"   # 0x4E - '+' numpad
+        "movb $49, 79(%0)\n\t"   # 0x4F - '1' numpad (end)
+        : : "r"(base));
+
+    # Row: scancodes 0x50-0x58
+    asm("movb $50,  80(%0)\n\t"  # 0x50 - '2' numpad (down)
+        "movb $51,  81(%0)\n\t"  # 0x51 - '3' numpad (pgdn)
+        "movb $48,  82(%0)\n\t"  # 0x52 - '0' numpad (ins)
+        "movb $46,  83(%0)\n\t"  # 0x53 - '.' numpad (del)
+        "movb $0,   84(%0)\n\t"
+        "movb $0,   85(%0)\n\t"
+        "movb $0,   86(%0)\n\t"
+        "movb $0,   87(%0)\n\t"  # 0x57 - F11
+        "movb $0,   88(%0)\n\t"  # 0x58 - F12
+        : : "r"(base));
+
+    # ─── Shifted map (0x9080 base) ─────────────────────────────────────────────
+    var sbase: *u8 = 0x9080;
+
+    # Shifted row 0x00-0x0F
+    asm("movb $0,   0(%0)\n\t"   # none
+        "movb $27,  1(%0)\n\t"   # ESC (same)
+        "movb $33,  2(%0)\n\t"   # '!'
+        "movb $64,  3(%0)\n\t"   # '@'
+        "movb $35,  4(%0)\n\t"   # '#'
+        "movb $36,  5(%0)\n\t"   # '$'
+        "movb $37,  6(%0)\n\t"   # '%%'
+        "movb $94,  7(%0)\n\t"   # '^'
+        "movb $38,  8(%0)\n\t"   # '&'
+        "movb $42,  9(%0)\n\t"   # '*'
+        "movb $40, 10(%0)\n\t"   # '('
+        "movb $41, 11(%0)\n\t"   # ')'
+        "movb $95, 12(%0)\n\t"   # '_'
+        "movb $43, 13(%0)\n\t"   # '+'
+        "movb $8,  14(%0)\n\t"   # Backspace (same)
+        "movb $9,  15(%0)\n\t"   # Tab (same)
+        : : "r"(sbase));
+
+    # Shifted row 0x10-0x1F  (uppercase letters)
+    asm("movb $81,  16(%0)\n\t"  # 'Q'
+        "movb $87,  17(%0)\n\t"  # 'W'
+        "movb $69,  18(%0)\n\t"  # 'E'
+        "movb $82,  19(%0)\n\t"  # 'R'
+        "movb $84,  20(%0)\n\t"  # 'T'
+        "movb $89,  21(%0)\n\t"  # 'Y'
+        "movb $85,  22(%0)\n\t"  # 'U'
+        "movb $73,  23(%0)\n\t"  # 'I'
+        "movb $79,  24(%0)\n\t"  # 'O'
+        "movb $80,  25(%0)\n\t"  # 'P'
+        "movb $123, 26(%0)\n\t"  # '{'
+        "movb $125, 27(%0)\n\t"  # '}'
+        "movb $10,  28(%0)\n\t"  # Enter
+        "movb $0,   29(%0)\n\t"  # Ctrl
+        "movb $65,  30(%0)\n\t"  # 'A'
+        "movb $83,  31(%0)\n\t"  # 'S'
+        : : "r"(sbase));
+
+    # Shifted row 0x20-0x2F
+    asm("movb $68,  32(%0)\n\t"  # 'D'
+        "movb $70,  33(%0)\n\t"  # 'F'
+        "movb $71,  34(%0)\n\t"  # 'G'
+        "movb $72,  35(%0)\n\t"  # 'H'
+        "movb $74,  36(%0)\n\t"  # 'J'
+        "movb $75,  37(%0)\n\t"  # 'K'
+        "movb $76,  38(%0)\n\t"  # 'L'
+        "movb $58,  39(%0)\n\t"  # ':'
+        "movb $34,  40(%0)\n\t"  # '"'
+        "movb $126, 41(%0)\n\t"  # '~'
+        "movb $0,   42(%0)\n\t"  # Shift
+        "movb $124, 43(%0)\n\t"  # '|'
+        "movb $90,  44(%0)\n\t"  # 'Z'
+        "movb $88,  45(%0)\n\t"  # 'X'
+        "movb $67,  46(%0)\n\t"  # 'C'
+        "movb $86,  47(%0)\n\t"  # 'V'
+        : : "r"(sbase));
+
+    # Shifted row 0x30-0x39
+    asm("movb $66,  48(%0)\n\t"  # 'B'
+        "movb $78,  49(%0)\n\t"  # 'N'
+        "movb $77,  50(%0)\n\t"  # 'M'
+        "movb $60,  51(%0)\n\t"  # '<'
+        "movb $62,  52(%0)\n\t"  # '>'
+        "movb $63,  53(%0)\n\t"  # '?'
+        "movb $0,   54(%0)\n\t"  # Shift
+        "movb $42,  55(%0)\n\t"  # '*'
+        "movb $0,   56(%0)\n\t"  # Alt
+        "movb $32,  57(%0)\n\t"  # Space
+        : : "r"(sbase));
+}
+
+# ─── Read one scancode from the keyboard controller ───────────────────────────
+func _get_scancode() -> u8 {
     while (true) {
-        var status = __inb(0x64);
+        var status = hw::inb(hw::KEYBOARD_STATUS_PORT);
         if ((status & 1) != 0) {
             break;
         }
     }
-    
-    # Read the actual scancode from Port 0x60
-    return __inb(0x60);
+    return hw::inb(hw::KEYBOARD_DATA_PORT);
 }
 
-# Very basic US QWERTY Scancode to ASCII map (simplified)
-# We only map a few keys for the demo shell.
-func scancode_to_ascii(scancode: u8) -> u8 {
-    if (scancode == 0x1E) { return 97; } # 'a'
-    if (scancode == 0x30) { return 98; } # 'b'
-    if (scancode == 0x2E) { return 99; } # 'c'
-    if (scancode == 0x20) { return 100;} # 'd'
-    if (scancode == 0x12) { return 101;} # 'e'
-    if (scancode == 0x21) { return 102;} # 'f'
-    if (scancode == 0x22) { return 103;} # 'g'
-    if (scancode == 0x23) { return 104;} # 'h'
-    if (scancode == 0x17) { return 105;} # 'i'
-    if (scancode == 0x24) { return 106;} # 'j'
-    if (scancode == 0x25) { return 107;} # 'k'
-    if (scancode == 0x26) { return 108;} # 'l'
-    if (scancode == 0x32) { return 109;} # 'm'
-    if (scancode == 0x31) { return 110;} # 'n'
-    if (scancode == 0x18) { return 111;} # 'o'
-    if (scancode == 0x19) { return 112;} # 'p'
-    if (scancode == 0x10) { return 113;} # 'q'
-    if (scancode == 0x13) { return 114;} # 'r'
-    if (scancode == 0x1F) { return 115;} # 's'
-    if (scancode == 0x14) { return 116;} # 't'
-    if (scancode == 0x16) { return 117;} # 'u'
-    if (scancode == 0x2F) { return 118;} # 'v'
-    if (scancode == 0x11) { return 119;} # 'w'
-    if (scancode == 0x2D) { return 120;} # 'x'
-    if (scancode == 0x15) { return 121;} # 'y'
-    if (scancode == 0x2C) { return 122;} # 'z'
-    
-    if (scancode == 0x39) { return 32; } # Space
-    if (scancode == 0x1C) { return 10; } # Enter (\n)
-    
-    return 0; # Unknown / Key release
+# ─── Read a full key event ────────────────────────────────────────────────────
+# Returns a packed u32:  [mods:8][special:8][ascii:8][0:8]
+# Use key_ascii(), key_special(), key_mods() helpers to unpack.
+func read_key() -> u32 {
+    while (true) {
+        var sc = _get_scancode();
+
+        # Extended key prefix — next scancode is an extended key
+        if (sc == 0xE0) {
+            extended = 1;
+            continue;
+        }
+
+        # Key release — upper bit set (0x80)
+        if ((sc & 0x80) != 0) {
+            var base_sc: u8 = sc & 0x7F;
+            # Track modifier releases
+            if (base_sc == 0x2A || base_sc == 0x36) { shift_down = 0; }
+            if (base_sc == 0x1D) { ctrl_down = 0; }
+            if (base_sc == 0x38) { alt_down = 0; }
+            extended = 0;
+            continue;
+        }
+
+        # ── Handle modifiers / toggles ─────────────────────────────────────
+        if (sc == 0x2A || sc == 0x36) { shift_down = 1; extended = 0; continue; }  # Shift
+        if (sc == 0x1D) { ctrl_down = 1; extended = 0; continue; }                  # Ctrl
+        if (sc == 0x38) { alt_down  = 1; extended = 0; continue; }                  # Alt
+        if (sc == 0x3A) { # CapsLock toggle
+            if (caps_lock == 0) { caps_lock = 1; } else { caps_lock = 0; }
+            extended = 0;
+            continue;
+        }
+
+        # ── Extended keys (arrows, Home, End, etc.) ────────────────────────
+        var special: u8 = KEY_NONE;
+        if (extended != 0) {
+            if (sc == 0x48) { special = KEY_UP; }
+            if (sc == 0x50) { special = KEY_DOWN; }
+            if (sc == 0x4B) { special = KEY_LEFT; }
+            if (sc == 0x4D) { special = KEY_RIGHT; }
+            if (sc == 0x47) { special = KEY_HOME; }
+            if (sc == 0x4F) { special = KEY_END; }
+            if (sc == 0x49) { special = KEY_PGUP; }
+            if (sc == 0x51) { special = KEY_PGDN; }
+            if (sc == 0x52) { special = KEY_INSERT; }
+            if (sc == 0x53) { special = KEY_DEL; }
+            extended = 0;
+            if (special != KEY_NONE) {
+                var mods: u8 = (ctrl_down * MOD_CTRL) | (shift_down * MOD_SHIFT) | (alt_down * MOD_ALT);
+                var result: u32 = 0;
+                asm("movzbl %b1, %0\n\t" "shll $8, %0\n\t"
+                    : "=r"(result) : "q"(special));
+                var m32: u32 = 0;
+                asm("movzbl %b1, %0\n\t" : "=r"(m32) : "q"(mods));
+                result = result | (m32 << 16);
+                return result;
+            }
+            continue;
+        }
+
+        # ── F-keys ─────────────────────────────────────────────────────────
+        if (sc == 0x3B) { special = KEY_F1;  }
+        if (sc == 0x3C) { special = KEY_F2;  }
+        if (sc == 0x3D) { special = KEY_F3;  }
+        if (sc == 0x3E) { special = KEY_F4;  }
+        if (sc == 0x3F) { special = KEY_F5;  }
+        if (sc == 0x40) { special = KEY_F6;  }
+        if (sc == 0x41) { special = KEY_F7;  }
+        if (sc == 0x42) { special = KEY_F8;  }
+        if (sc == 0x43) { special = KEY_F9;  }
+        if (sc == 0x44) { special = KEY_F10; }
+        if (sc == 0x57) { special = KEY_F11; }
+        if (sc == 0x58) { special = KEY_F12; }
+
+        if (special != KEY_NONE) {
+            var mods: u8 = (ctrl_down * MOD_CTRL) | (shift_down * MOD_SHIFT) | (alt_down * MOD_ALT);
+            var result: u32 = 0;
+            asm("movzbl %b1, %0\n\t" "shll $8, %0\n\t"
+                : "=r"(result) : "q"(special));
+            var m32: u32 = 0;
+            asm("movzbl %b1, %0\n\t" : "=r"(m32) : "q"(mods));
+            result = result | (m32 << 16);
+            return result;
+        }
+
+        # ── Regular keys — look up in keymap ───────────────────────────────
+        var base: *u8 = 0x9000;
+        var sbase: *u8 = 0x9080;
+
+        # Bounds check (scancode must be < 128)
+        if (sc >= 128) { continue; }
+
+        var ascii: u8 = 0;
+
+        # Determine shifted state: shift XOR caps (caps only flips letters)
+        var shifted = shift_down;
+
+        # Check if this is a letter key (result from unshifted map is a-z, 97-122)
+        var unshifted_ch: u8 = 0;
+        asm("movzbl %b1, %%eax\n\t"
+            "add %2, %%eax\n\t"
+            "movb (%%eax), %b0\n\t"
+            : "=q"(unshifted_ch) : "q"(sc), "r"(base) : "%eax");
+
+        if (unshifted_ch >= 97 && unshifted_ch <= 122) {
+            # It's a letter — caps XOR shift decides case
+            if (caps_lock != shift_down) {
+                shifted = 1;
+            } else {
+                shifted = 0;
+            }
+        }
+
+        if (shifted != 0) {
+            asm("movzbl %b1, %%eax\n\t"
+                "add %2, %%eax\n\t"
+                "movb (%%eax), %b0\n\t"
+                : "=q"(ascii) : "q"(sc), "r"(sbase) : "%eax");
+        } else {
+            ascii = unshifted_ch;
+        }
+
+        if (ascii == 0) { continue; }   # Unmapped key, ignore
+
+        # Apply Ctrl: strip bit 6 (Ctrl+letter = ASCII control code)
+        if (ctrl_down != 0 && ascii >= 64 && ascii <= 95) {
+            ascii = ascii & 0x1F;
+        }
+        if (ctrl_down != 0 && ascii >= 97 && ascii <= 122) {
+            ascii = (ascii - 32) & 0x1F;
+        }
+
+        var mods: u8 = (ctrl_down * MOD_CTRL) | (shift_down * MOD_SHIFT) | (alt_down * MOD_ALT);
+        if (caps_lock != 0) { mods = mods | MOD_CAPS; }
+
+        var result: u32 = 0;
+        asm("movzbl %b1, %0\n\t" : "=r"(result) : "q"(ascii));
+        var m32: u32 = 0;
+        asm("movzbl %b1, %0\n\t" : "=r"(m32) : "q"(mods));
+        result = result | (m32 << 16);
+        return result;
+    }
+    return 0;
+}
+
+# ─── Unpack helpers ───────────────────────────────────────────────────────────
+
+func key_ascii(ev: u32) -> u8 {
+    var r: u8 = 0;
+    asm("movl %1, %%eax\n\t"
+        "andl $0xFF, %%eax\n\t"
+        "movb %%al, %b0\n\t"
+        : "=q"(r) : "r"(ev) : "%eax");
+    return r;
+}
+
+func key_special(ev: u32) -> u8 {
+    var r: u8 = 0;
+    asm("movl %1, %%eax\n\t"
+        "shrl $8, %%eax\n\t"
+        "andl $0xFF, %%eax\n\t"
+        "movb %%al, %b0\n\t"
+        : "=q"(r) : "r"(ev) : "%eax");
+    return r;
+}
+
+func key_mods(ev: u32) -> u8 {
+    var r: u8 = 0;
+    asm("movl %1, %%eax\n\t"
+        "shrl $16, %%eax\n\t"
+        "andl $0xFF, %%eax\n\t"
+        "movb %%al, %b0\n\t"
+        : "=q"(r) : "r"(ev) : "%eax");
+    return r;
+}
+
+func key_is_ctrl(ev: u32) -> u8 {
+    var mods = key_mods(ev);
+    return mods & MOD_CTRL;
 }

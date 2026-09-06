@@ -1,6 +1,7 @@
 @[no_std]
 
-import vga;
+import std::hw;
+import std::io;
 import shell;
 import fs;
 import ramfs;
@@ -9,11 +10,11 @@ import ramfs;
 @[entry]
 func kmain() {
     # Initialize hardware drivers
-    vga::clear_screen();
+    io::clear();
     
     # Hand off execution to the interactive shell
     shell::start_shell();
     
     # We should never return here, but just in case:
-    asm("cli; hlt");
+    hw::halt_forever();
 }

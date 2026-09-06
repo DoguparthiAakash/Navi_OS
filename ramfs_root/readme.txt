@@ -1,1 +1,1 @@
-Welcome to Navi OS! This is a real file stored in NuxFS (RamFS).
+Welcome to Navi OS! Powered by the Nux language.

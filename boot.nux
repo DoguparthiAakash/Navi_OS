@@ -1,0 +1,39 @@
+# boot.nux - Multiboot header and kernel entry point
+# Written entirely in Nux - no assembly files needed.
+# The Nux compiler's native backend handles the inline asm blocks.
+
+@[multiboot_header]
+# Multiboot magic constants
+var MULTIBOOT_MAGIC: u32 = 0x1BADB002;
+var MULTIBOOT_FLAGS: u32 = 0x00000003;    # ALIGN | MEMINFO
+var MULTIBOOT_CHECKSUM: u32 = -(0x1BADB002 + 0x00000003);
+
+# The Nux native compiler emits this as a .multiboot section with .long directives.
+# GCC + the linker script (linker.ld) will place this at the correct location.
+asm(".section .multiboot\n"
+    ".align 4\n"
+    ".long 0x1BADB002\n"
+    ".long 0x00000003\n"
+    ".long -(0x1BADB002 + 0x00000003)\n");
+
+# 16 KiB stack in BSS
+asm(".section .bss\n"
+    ".align 16\n"
+    "stack_bottom:\n"
+    ".skip 16384\n"
+    "stack_top:\n");
+
+# _start: the entry point called by GRUB
+@[entry]
+func boot_entry() {
+    asm(".section .text\n"
+        ".global _start\n"
+        ".type _start, @function\n"
+        "_start:\n"
+        "    mov $stack_top, %esp\n"
+        "    call kmain\n"
+        "    cli\n"
+        "1:  hlt\n"
+        "    jmp 1b\n"
+        ".size _start, . - _start\n");
+}

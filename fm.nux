@@ -1,0 +1,385 @@
+@[no_std]
+
+import std::io;
+import std::string;
+import keyboard;
+import ramfs;
+import edit;
+
+# ─── fm.nux — Full-Screen File Manager ───────────────────────────────────────
+#
+# Layout (80×25 VGA):
+#   Row 0:    Title bar (blue)
+#   Rows 1-21: File listing (left column) + Dir listing (right column)
+#   Row 22:   Separator
+#   Row 23:   Status bar / prompt area
+#   Row 24:   Shortcuts bar
+#
+# Keys:
+#   Up/Down     Navigate cursor
+#   Enter       Open file (in editor) or open directory (not yet)
+#   n           New file (prompt for name)
+#   m           New directory (prompt for name)
+#   d / Del     Delete selected file or directory
+#   r           Rename (not yet — future)
+#   Tab         Switch focus between files / dirs panels
+#   q / Esc     Quit file manager
+
+var FM_LIST_ROWS:   u32 = 21;    # Rows 1-21
+var FM_LEFT_COL:    u32 = 0;
+var FM_RIGHT_COL:   u32 = 40;
+
+# State
+var fm_file_cursor: u32 = 0;
+var fm_dir_cursor:  u32 = 0;
+var fm_focus:       u8  = 0;   # 0 = files panel, 1 = dirs panel
+var fm_file_scroll: u32 = 0;
+var fm_dir_scroll:  u32 = 0;
+
+# Input prompt buffer (for new file/dir name prompts)
+var PROMPT_BUF: *u8 = 0x004E0000;
+var prompt_len: u32 = 0;
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+func _fm_str_len(s: *u8) -> u32 {
+    var i: u32 = 0;
+    while (true) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(s), "r"(i) : "%eax");
+        if (c == 0) { return i; }
+        i += 1;
+    }
+    return 0;
+}
+
+func _fm_null_term(buf: *u8, len: u32) {
+    asm("movb $0, (%0,%1,1)\n\t" : : "r"(buf), "r"(len));
+}
+
+# ─── Rendering ────────────────────────────────────────────────────────────────
+
+func _fm_render_title() {
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLUE);
+    io::clear_row(0);
+    io::print_at("  Nux File Manager   [Files]                 [Directories]", 0, 0);
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _fm_render_separator() {
+    io::set_color(io::COLOR_DARK_GREY, io::COLOR_BLACK);
+    io::clear_row(22);
+    var col: u32 = 0;
+    while (col < 80) {
+        io::print_char_at(196, col, 22);  # '─' box char
+        col += 1;
+    }
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _fm_render_shortcuts() {
+    io::set_color(io::COLOR_BLACK, io::COLOR_LIGHT_GREY);
+    io::clear_row(24);
+    io::print_at("n=NewFile  m=NewDir  d=Delete  Enter=Open/Edit  Tab=Panel  q=Quit", 0, 24);
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _fm_render_status(msg: *u8) {
+    io::set_color(io::COLOR_YELLOW, io::COLOR_BLACK);
+    io::clear_row(23);
+    io::print_at(msg, 0, 23);
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _fm_render_files() {
+    var row: u32 = 0;
+    while (row < FM_LIST_ROWS) {
+        var file_idx = row + fm_file_scroll;
+        var screen_row = row + 1;
+
+        # Determine if this row is the cursor row (and if we're focused on files)
+        var is_selected: u8 = 0;
+        if (fm_focus == 0 && file_idx == fm_file_cursor) { is_selected = 1; }
+
+        var fname = ramfs::get_file_name_at(file_idx);
+
+        if (fname == 0) {
+            # Empty row
+            io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            io::clear_cols(FM_LEFT_COL, 38, screen_row);
+        } else {
+            if (is_selected != 0) {
+                if (fm_focus == 0) {
+                    io::set_color(io::COLOR_BLACK, io::COLOR_CYAN);
+                } else {
+                    io::set_color(io::COLOR_WHITE, io::COLOR_DARK_GREY);
+                }
+            } else {
+                io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            }
+            io::clear_cols(FM_LEFT_COL, 38, screen_row);
+            io::print_char_at(32, FM_LEFT_COL, screen_row);
+            io::print_at(fname, FM_LEFT_COL + 2, screen_row);
+
+            # Print file size on right of left column
+            var sz = ramfs::get_file_size(fname);
+            io::print_u32_at(sz, 34, screen_row);
+            io::print_char_at(32, 39, screen_row);
+        }
+        row += 1;
+    }
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _fm_render_dirs() {
+    var row: u32 = 0;
+    while (row < FM_LIST_ROWS) {
+        var dir_idx = row + fm_dir_scroll;
+        var screen_row = row + 1;
+
+        var is_selected: u8 = 0;
+        if (fm_focus == 1 && dir_idx == fm_dir_cursor) { is_selected = 1; }
+
+        var dname = ramfs::get_dir_name_at(dir_idx);
+
+        if (dname == 0) {
+            io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            io::clear_cols(FM_RIGHT_COL, 38, screen_row);
+        } else {
+            if (is_selected != 0) {
+                if (fm_focus == 1) {
+                    io::set_color(io::COLOR_BLACK, io::COLOR_YELLOW);
+                } else {
+                    io::set_color(io::COLOR_WHITE, io::COLOR_DARK_GREY);
+                }
+            } else {
+                io::set_color(io::COLOR_LIGHT_GREEN, io::COLOR_BLACK);
+            }
+            io::clear_cols(FM_RIGHT_COL, 38, screen_row);
+            io::print_char_at(47, FM_RIGHT_COL, screen_row);  # '/'
+            io::print_at(dname, FM_RIGHT_COL + 1, screen_row);
+        }
+        row += 1;
+    }
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+# ─── Input Prompt ─────────────────────────────────────────────────────────────
+
+# Reads a line into PROMPT_BUF from the keyboard.
+# Draws into row 23 (status row).  Returns 1 if confirmed, 0 if ESC'd.
+func _prompt(msg: *u8) -> u8 {
+    prompt_len = 0;
+    _fm_null_term(PROMPT_BUF, 0);
+
+    while (true) {
+        io::set_color(io::COLOR_YELLOW, io::COLOR_BLACK);
+        io::clear_row(23);
+        io::print_at(msg, 0, 23);
+        var msg_len = _fm_str_len(msg);
+        io::print_at(PROMPT_BUF, msg_len, 23);
+        io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+
+        var ev = keyboard::read_key();
+        var ascii   = keyboard::key_ascii(ev);
+        var special = keyboard::key_special(ev);
+
+        if (ascii == 27 || special == keyboard::KEY_ESC) { return 0; }
+        if (ascii == 10 || ascii == 13) {
+            _fm_null_term(PROMPT_BUF, prompt_len);
+            return 1;
+        }
+        if (ascii == 8 && prompt_len > 0) {
+            prompt_len -= 1;
+            _fm_null_term(PROMPT_BUF, prompt_len);
+            continue;
+        }
+        if (ascii >= 32 && ascii < 127 && prompt_len < 14) {
+            asm("movb %b2, (%0,%1,1)\n\t" : : "r"(PROMPT_BUF), "r"(prompt_len), "q"(ascii));
+            prompt_len += 1;
+            _fm_null_term(PROMPT_BUF, prompt_len);
+        }
+    }
+    return 0;
+}
+
+# ─── Public Entry Point ───────────────────────────────────────────────────────
+
+func open() {
+    keyboard::init_keymaps();
+
+    fm_file_cursor = 0;
+    fm_dir_cursor  = 0;
+    fm_focus       = 0;
+    fm_file_scroll = 0;
+    fm_dir_scroll  = 0;
+
+    io::clear();
+
+    while (true) {
+        _fm_render_title();
+        _fm_render_files();
+
+        # Draw vertical divider (column 39)
+        var r: u32 = 1;
+        while (r <= FM_LIST_ROWS) {
+            io::set_color(io::COLOR_DARK_GREY, io::COLOR_BLACK);
+            io::print_char_at(179, 39, r);  # '│'
+            r += 1;
+        }
+        io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+
+        _fm_render_dirs();
+        _fm_render_separator();
+        _fm_render_shortcuts();
+
+        # Status: show selected file/dir info
+        if (fm_focus == 0) {
+            var fname = ramfs::get_file_name_at(fm_file_cursor);
+            if (fname != 0) {
+                io::set_color(io::COLOR_CYAN, io::COLOR_BLACK);
+                io::clear_row(23);
+                io::print_at("File: ", 0, 23);
+                io::print_at(fname, 6, 23);
+                io::print_at("  Size: ", 6 + _fm_str_len(fname), 23);
+                io::print_u32_at(ramfs::get_file_size(fname), 14 + _fm_str_len(fname), 23);
+                io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            }
+        } else {
+            var dname = ramfs::get_dir_name_at(fm_dir_cursor);
+            if (dname != 0) {
+                io::set_color(io::COLOR_LIGHT_GREEN, io::COLOR_BLACK);
+                io::clear_row(23);
+                io::print_at("Dir: /", 0, 23);
+                io::print_at(dname, 6, 23);
+                io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            }
+        }
+
+        var ev = keyboard::read_key();
+        var ascii   = keyboard::key_ascii(ev);
+        var special = keyboard::key_special(ev);
+
+        # ── Quit ──────────────────────────────────────────────────────────
+        if (ascii == 113 || ascii == 27) { # 'q' or ESC
+            io::clear();
+            return;
+        }
+
+        # ── Tab: switch panel ──────────────────────────────────────────────
+        if (ascii == 9) {
+            if (fm_focus == 0) { fm_focus = 1; } else { fm_focus = 0; }
+            continue;
+        }
+
+        # ── Arrow navigation ───────────────────────────────────────────────
+        if (special == keyboard::KEY_UP) {
+            if (fm_focus == 0 && fm_file_cursor > 0) {
+                fm_file_cursor -= 1;
+                if (fm_file_cursor < fm_file_scroll) { fm_file_scroll -= 1; }
+            }
+            if (fm_focus == 1 && fm_dir_cursor > 0) {
+                fm_dir_cursor -= 1;
+                if (fm_dir_cursor < fm_dir_scroll) { fm_dir_scroll -= 1; }
+            }
+            continue;
+        }
+        if (special == keyboard::KEY_DOWN) {
+            if (fm_focus == 0) {
+                var next = fm_file_cursor + 1;
+                if (ramfs::get_file_name_at(next) != 0 || next < ramfs::file_count) {
+                    fm_file_cursor = next;
+                    if (fm_file_cursor >= fm_file_scroll + FM_LIST_ROWS) { fm_file_scroll += 1; }
+                }
+            }
+            if (fm_focus == 1) {
+                var next = fm_dir_cursor + 1;
+                if (ramfs::get_dir_name_at(next) != 0 || next < ramfs::dir_count) {
+                    fm_dir_cursor = next;
+                    if (fm_dir_cursor >= fm_dir_scroll + FM_LIST_ROWS) { fm_dir_scroll += 1; }
+                }
+            }
+            continue;
+        }
+
+        # ── Enter: open in editor (files panel only) ───────────────────────
+        if (ascii == 10 || ascii == 13) {
+            if (fm_focus == 0) {
+                var fname = ramfs::get_file_name_at(fm_file_cursor);
+                if (fname != 0) {
+                    edit::open(fname);
+                    io::clear();
+                }
+            }
+            continue;
+        }
+
+        # ── n: new file ────────────────────────────────────────────────────
+        if (ascii == 110) { # 'n'
+            var ok = _prompt("New file name: ");
+            if (ok != 0 && prompt_len > 0) {
+                var empty: *u8 = "";
+                var result = ramfs::create_file(PROMPT_BUF, empty, 0);
+                if (result == 0) {
+                    _fm_render_status("Error: file already exists or too many files.");
+                } else {
+                    # Open the new empty file in editor
+                    edit::open(PROMPT_BUF);
+                    io::clear();
+                }
+            }
+            continue;
+        }
+
+        # ── m: new directory ───────────────────────────────────────────────
+        if (ascii == 109) { # 'm'
+            var ok = _prompt("New directory name: ");
+            if (ok != 0 && prompt_len > 0) {
+                var result = ramfs::create_dir(PROMPT_BUF);
+                if (result == 0) {
+                    _fm_render_status("Error: directory already exists or too many dirs.");
+                }
+            }
+            continue;
+        }
+
+        # ── d / Delete: delete ─────────────────────────────────────────────
+        if (ascii == 100 || special == keyboard::KEY_DEL) { # 'd' or Del
+            if (fm_focus == 0) {
+                var fname = ramfs::get_file_name_at(fm_file_cursor);
+                if (fname != 0) {
+                    io::set_color(io::COLOR_WHITE, io::COLOR_RED);
+                    io::clear_row(23);
+                    io::print_at("Delete '", 0, 23);
+                    io::print_at(fname, 8, 23);
+                    io::print_at("'? (Y/N)", 8 + _fm_str_len(fname), 23);
+                    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+                    var conf = keyboard::read_key();
+                    var conf_ch = keyboard::key_ascii(conf);
+                    if (conf_ch == 121 || conf_ch == 89) { # 'y' or 'Y'
+                        ramfs::delete_file(fname);
+                        if (fm_file_cursor > 0) { fm_file_cursor -= 1; }
+                    }
+                }
+            } else {
+                var dname = ramfs::get_dir_name_at(fm_dir_cursor);
+                if (dname != 0) {
+                    io::set_color(io::COLOR_WHITE, io::COLOR_RED);
+                    io::clear_row(23);
+                    io::print_at("Delete dir '", 0, 23);
+                    io::print_at(dname, 12, 23);
+                    io::print_at("'? (Y/N)", 12 + _fm_str_len(dname), 23);
+                    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+                    var conf = keyboard::read_key();
+                    var conf_ch = keyboard::key_ascii(conf);
+                    if (conf_ch == 121 || conf_ch == 89) {
+                        ramfs::delete_dir(dname);
+                        if (fm_dir_cursor > 0) { fm_dir_cursor -= 1; }
+                    }
+                }
+            }
+            continue;
+        }
+    }
+}

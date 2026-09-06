@@ -1,0 +1,550 @@
+@[no_std]
+
+import std::hw;
+import std::io;
+import std::string;
+import keyboard;
+import ramfs;
+
+# ─── edit.nux — Dual-Mode Text Editor (Nano + Vim) ──────────────────────────
+#
+# F1 = switch to Nano mode (mode-less)
+# F2 = switch to Vim mode (modal)
+# Default: Nano mode
+#
+# Nano mode:  Type to insert. Ctrl+S = save. Ctrl+X = exit (prompt save).
+#             Arrow keys move cursor.  Backspace deletes.
+#
+# Vim mode:   Normal mode by default.
+#             i = insert before cursor  a = insert after  ESC = back to normal
+#             h/j/k/l = left/down/up/right (also arrow keys work everywhere)
+#             :w = save   :q = quit   :wq = save+quit   :q! = quit no save
+#             x = delete char  dd = delete line (not yet implemented)
+
+# ─── Editor buffer constants ──────────────────────────────────────────────────
+var EDIT_BUF:   *u8 = 0x00500000;    # 512 KB editor text buffer
+var EDIT_ROWS:  *u32 = 0x00580000;   # Row start offsets (2048 rows max × 4 bytes)
+var MAX_EDIT_LINES: u32 = 2048;
+var MAX_EDIT_COLS:  u32 = 79;        # 80 columns - 1
+var SCREEN_ROWS:    u32 = 23;        # Reserve top row for title, bottom for status
+
+# ─── Editor State ─────────────────────────────────────────────────────────────
+var edit_buf_len: u32 = 0;
+var edit_cursor:  u32 = 0;     # Byte offset into EDIT_BUF
+var edit_row:     u32 = 0;     # Current visible row cursor is on
+var edit_col:     u32 = 0;     # Current column
+var edit_scroll:  u32 = 0;     # First visible line index
+var edit_filename: *u8 = 0;
+var edit_modified: u8 = 0;
+
+# VIM mode flags
+var NANO_MODE: u8 = 0;
+var VIM_MODE:  u8 = 1;
+var edit_mode: u8 = 0;       # 0 = nano, 1 = vim
+var vim_insert: u8 = 0;      # 1 = vim insert mode active
+
+# Vim command buffer for : commands
+var vim_cmd_buf: *u8 = 0x004F0000;
+var vim_cmd_len: u32 = 0;
+var vim_in_colon: u8 = 0;
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+func _edit_putch(buf: *u8, offset: u32, ch: u8) {
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buf), "r"(offset), "q"(ch));
+}
+
+func _edit_getch(buf: *u8, offset: u32) -> u8 {
+    var c: u8 = 0;
+    asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+        : "=q"(c) : "r"(buf), "r"(offset) : "%eax");
+    return c;
+}
+
+func _edit_strlen(buf: *u8) -> u32 {
+    var i: u32 = 0;
+    while (true) {
+        var c = _edit_getch(buf, i);
+        if (c == 0) { return i; }
+        i += 1;
+    }
+    return 0;
+}
+
+# ─── Buffer Insert / Delete ───────────────────────────────────────────────────
+
+# Insert one byte at cursor position
+func _buf_insert(ch: u8) {
+    if (edit_buf_len >= 524288) { return; } # Buffer full
+    # Shift bytes from cursor to end right by 1
+    var i = edit_buf_len;
+    while (i > edit_cursor) {
+        var prev = i - 1;
+        var c = _edit_getch(EDIT_BUF, prev);
+        _edit_putch(EDIT_BUF, i, c);
+        i -= 1;
+    }
+    _edit_putch(EDIT_BUF, edit_cursor, ch);
+    edit_buf_len += 1;
+    edit_cursor += 1;
+    edit_modified = 1;
+}
+
+# Delete byte before cursor (backspace)
+func _buf_backspace() {
+    if (edit_cursor == 0) { return; }
+    edit_cursor -= 1;
+    var i = edit_cursor;
+    while (i < edit_buf_len - 1) {
+        var next = i + 1;
+        var c = _edit_getch(EDIT_BUF, next);
+        _edit_putch(EDIT_BUF, i, c);
+        i += 1;
+    }
+    edit_buf_len -= 1;
+    edit_modified = 1;
+}
+
+# Delete byte at cursor position (Delete key)
+func _buf_delete_at() {
+    if (edit_cursor >= edit_buf_len) { return; }
+    var i = edit_cursor;
+    while (i < edit_buf_len - 1) {
+        var next = i + 1;
+        var c = _edit_getch(EDIT_BUF, next);
+        _edit_putch(EDIT_BUF, i, c);
+        i += 1;
+    }
+    edit_buf_len -= 1;
+    edit_modified = 1;
+}
+
+# ─── Load file into buffer ────────────────────────────────────────────────────
+
+func _load_file(name: *u8) {
+    var data = ramfs::get_file_data(name);
+    var sz   = ramfs::get_file_size(name);
+    if (data == 0) {
+        edit_buf_len = 0;
+        _edit_putch(EDIT_BUF, 0, 0);
+        return;
+    }
+    # Copy data into edit buffer
+    var i: u32 = 0;
+    while (i < sz) {
+        var c = _edit_getch(data, i);
+        _edit_putch(EDIT_BUF, i, c);
+        i += 1;
+    }
+    _edit_putch(EDIT_BUF, sz, 0);
+    edit_buf_len = sz;
+}
+
+# ─── Save buffer to RamFS ─────────────────────────────────────────────────────
+
+func _save_file() {
+    _edit_putch(EDIT_BUF, edit_buf_len, 0);
+    ramfs::write_file(edit_filename, EDIT_BUF, edit_buf_len);
+    edit_modified = 0;
+}
+
+# ─── Cursor Navigation ────────────────────────────────────────────────────────
+
+func _cursor_move_left() {
+    if (edit_cursor > 0) { edit_cursor -= 1; }
+}
+
+func _cursor_move_right() {
+    if (edit_cursor < edit_buf_len) { edit_cursor += 1; }
+}
+
+func _cursor_move_up() {
+    # Find start of current line
+    var pos = edit_cursor;
+    if (pos > 0) { pos -= 1; }
+    while (pos > 0) {
+        var c = _edit_getch(EDIT_BUF, pos);
+        if (c == 10) { break; }
+        pos -= 1;
+    }
+    if (pos == 0) { edit_cursor = 0; return; }
+    # Now find start of previous line
+    pos -= 1;
+    var line_end = pos;
+    while (pos > 0) {
+        var c = _edit_getch(EDIT_BUF, pos);
+        if (c == 10) { pos += 1; break; }
+        pos -= 1;
+    }
+    # Move to same column
+    var target_col = edit_col;
+    var new_pos = pos;
+    var col: u32 = 0;
+    while (col < target_col) {
+        var c = _edit_getch(EDIT_BUF, new_pos);
+        if (c == 10 || c == 0 || new_pos > line_end) { break; }
+        new_pos += 1;
+        col += 1;
+    }
+    edit_cursor = new_pos;
+}
+
+func _cursor_move_down() {
+    # Scan forward to next newline
+    var pos = edit_cursor;
+    while (pos < edit_buf_len) {
+        var c = _edit_getch(EDIT_BUF, pos);
+        if (c == 10) { pos += 1; break; }
+        pos += 1;
+    }
+    if (pos >= edit_buf_len) { return; }
+    # Move to same column
+    var target_col = edit_col;
+    var col: u32 = 0;
+    while (col < target_col && pos < edit_buf_len) {
+        var c = _edit_getch(EDIT_BUF, pos);
+        if (c == 10 || c == 0) { break; }
+        pos += 1;
+        col += 1;
+    }
+    edit_cursor = pos;
+}
+
+# Recompute edit_row and edit_col from edit_cursor
+func _update_row_col() {
+    var row: u32 = 0;
+    var col: u32 = 0;
+    var i: u32 = 0;
+    while (i < edit_cursor) {
+        var c = _edit_getch(EDIT_BUF, i);
+        if (c == 10) {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        i += 1;
+    }
+    edit_row = row;
+    edit_col = col;
+}
+
+# ─── Screen Rendering ─────────────────────────────────────────────────────────
+
+func _render_title_bar(filename: *u8, mode_name: *u8) {
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLUE);
+    io::clear_row(0);
+    io::print_at("  Nux Editor  [", 0, 0);
+    io::print_at(filename, 15, 0);
+    io::print_at("]  Mode: ", 15 + _edit_strlen(filename), 0);
+    io::print_at(mode_name, 24 + _edit_strlen(filename), 0);
+    if (edit_modified != 0) {
+        io::print_at(" *", 30 + _edit_strlen(filename), 0);
+    }
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _render_status_bar_nano() {
+    io::set_color(io::COLOR_BLACK, io::COLOR_LIGHT_GREY);
+    io::clear_row(24);
+    io::print_at("^S Save  ^X Exit  ^C Interrupt  F2 Vim Mode  Arrows Move", 0, 24);
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _render_status_bar_vim(in_insert: u8) {
+    io::set_color(io::COLOR_BLACK, io::COLOR_LIGHT_GREY);
+    io::clear_row(24);
+    if (vim_in_colon != 0) {
+        io::print_at(":", 0, 24);
+        io::print_at(vim_cmd_buf, 1, 24);
+    } else if (in_insert != 0) {
+        io::set_color(io::COLOR_WHITE, io::COLOR_GREEN);
+        io::print_at("-- INSERT --  ESC=Normal  Arrows Move  Backspace Del", 0, 24);
+    } else {
+        io::print_at("NORMAL: i=Insert  :w=Save  :q=Quit  :wq=Save+Quit  :q!=Force Quit", 0, 24);
+    }
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+}
+
+func _render_content() {
+    _update_row_col();
+
+    # Adjust scroll
+    if (edit_row < edit_scroll) { edit_scroll = edit_row; }
+    if (edit_row >= edit_scroll + SCREEN_ROWS) { edit_scroll = edit_row - SCREEN_ROWS + 1; }
+
+    var screen_row: u32 = 1;   # Row 0 is title bar, row 24 is status
+    var buf_row: u32 = 0;
+    var i: u32 = 0;
+
+    # Find start of scroll row
+    while (buf_row < edit_scroll && i < edit_buf_len) {
+        var c = _edit_getch(EDIT_BUF, i);
+        if (c == 10) { buf_row += 1; }
+        i += 1;
+    }
+
+    # Render each visible line
+    while (screen_row <= SCREEN_ROWS) {
+        io::clear_row(screen_row);
+        var col: u32 = 0;
+        while (i <= edit_buf_len && col < 80) {
+            var c = _edit_getch(EDIT_BUF, i);
+            if (c == 10 || c == 0 || i == edit_buf_len) { break; }
+            io::print_char_at(c, col, screen_row);
+            col += 1;
+            i += 1;
+        }
+        # Skip past newline
+        if (i < edit_buf_len) {
+            var c = _edit_getch(EDIT_BUF, i);
+            if (c == 10) { i += 1; }
+        }
+        screen_row += 1;
+        buf_row += 1;
+    }
+
+    # Position cursor on screen
+    var cursor_screen_row = edit_row - edit_scroll + 1;
+    io::set_cursor(edit_col, cursor_screen_row);
+}
+
+# ─── Vim Colon Command Execution ──────────────────────────────────────────────
+
+# Returns 1 if should quit, 0 otherwise
+func _execute_vim_cmd() -> u8 {
+    _edit_putch(vim_cmd_buf, vim_cmd_len, 0);
+    var cmd = vim_cmd_buf;
+    if (string::eq(cmd, "w")) {
+        _save_file();
+        return 0;
+    }
+    if (string::eq(cmd, "q")) {
+        if (edit_modified != 0) {
+            # Show warning, don't quit
+            return 0;
+        }
+        return 1;
+    }
+    if (string::eq(cmd, "wq") || string::eq(cmd, "x")) {
+        _save_file();
+        return 1;
+    }
+    if (string::eq(cmd, "q!")) {
+        return 1;
+    }
+    return 0;
+}
+
+# ─── Public Entry Point ───────────────────────────────────────────────────────
+
+func editor_open(filename: *u8) {
+    keyboard::init_keymaps();
+
+    edit_filename = filename;
+    edit_cursor = 0;
+    edit_row = 0;
+    edit_col = 0;
+    edit_scroll = 0;
+    edit_modified = 0;
+    edit_mode = NANO_MODE;
+    vim_insert = 0;
+    vim_in_colon = 0;
+    vim_cmd_len = 0;
+
+    _load_file(filename);
+
+    io::clear();
+
+    while (true) {
+        if (edit_mode == NANO_MODE) {
+            _render_title_bar(filename, "NANO");
+            _render_status_bar_nano();
+        } else {
+            _render_title_bar(filename, "VIM");
+            _render_status_bar_vim(vim_insert);
+        }
+        _render_content();
+
+        var ev = keyboard::read_key();
+        var ascii   = keyboard::key_ascii(ev);
+        var special = keyboard::key_special(ev);
+        var mods    = keyboard::key_mods(ev);
+        var is_ctrl = keyboard::key_is_ctrl(ev);
+
+        # ── Mode switch via F1/F2 ──────────────────────────────────────────
+        if (special == keyboard::KEY_F1) { edit_mode = NANO_MODE; vim_insert = 0; continue; }
+        if (special == keyboard::KEY_F2) { edit_mode = VIM_MODE;  vim_insert = 0; continue; }
+
+        # ── Arrow keys (work in all modes) ────────────────────────────────
+        if (special == keyboard::KEY_UP)    { _cursor_move_up();    continue; }
+        if (special == keyboard::KEY_DOWN)  { _cursor_move_down();  continue; }
+        if (special == keyboard::KEY_LEFT)  { _cursor_move_left();  continue; }
+        if (special == keyboard::KEY_RIGHT) { _cursor_move_right(); continue; }
+
+        if (special == keyboard::KEY_HOME)  { 
+            # Go to start of line
+            while (edit_cursor > 0) {
+                var c = _edit_getch(EDIT_BUF, edit_cursor - 1);
+                if (c == 10) { break; }
+                edit_cursor -= 1;
+            }
+            continue; 
+        }
+        if (special == keyboard::KEY_END)   { 
+            # Go to end of line
+            while (edit_cursor < edit_buf_len) {
+                var c = _edit_getch(EDIT_BUF, edit_cursor);
+                if (c == 10) { break; }
+                edit_cursor += 1;
+            }
+            continue; 
+        }
+
+        # ── Nano Mode ──────────────────────────────────────────────────────
+        if (edit_mode == NANO_MODE) {
+            # Ctrl+X: exit
+            if (ascii == 24) { # Ctrl+X
+                if (edit_modified != 0) {
+                    io::set_color(io::COLOR_BLACK, io::COLOR_YELLOW);
+                    io::clear_row(24);
+                    io::print_at("Save before exit? (S=yes N=no)", 0, 24);
+                    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+                    var ans = keyboard::read_key();
+                    var ans_ch = keyboard::key_ascii(ans);
+                    if (ans_ch == 115 || ans_ch == 83) { _save_file(); }
+                }
+                io::clear();
+                return;
+            }
+            # Ctrl+S: save
+            if (ascii == 19) { _save_file(); continue; }
+            # Ctrl+C: clear / interrupt (stay in editor)
+            if (ascii == 3) { continue; }
+            # Backspace
+            if (ascii == 8) { _buf_backspace(); continue; }
+            # Delete key
+            if (special == keyboard::KEY_DEL) { _buf_delete_at(); continue; }
+            # Enter
+            if (ascii == 10 || ascii == 13) { _buf_insert(10); continue; }
+            # Tab
+            if (ascii == 9) { _buf_insert(32); _buf_insert(32); _buf_insert(32); _buf_insert(32); continue; }
+            # Printable
+            if (ascii >= 32 && ascii < 127) { _buf_insert(ascii); continue; }
+            continue;
+        }
+
+        # ── Vim Mode — Normal ──────────────────────────────────────────────
+        if (edit_mode == VIM_MODE && vim_insert == 0) {
+
+            # Colon command mode
+            if (vim_in_colon != 0) {
+                if (ascii == 10 || ascii == 13) {
+                    vim_in_colon = 0;
+                    var quit = _execute_vim_cmd();
+                    vim_cmd_len = 0;
+                    if (quit != 0) { io::clear(); return; }
+                } else if (ascii == 8) {
+                    if (vim_cmd_len > 0) { vim_cmd_len -= 1; }
+                } else if (ascii == 27) { # ESC
+                    vim_in_colon = 0;
+                    vim_cmd_len = 0;
+                } else if (ascii >= 32 && ascii < 127) {
+                    _edit_putch(vim_cmd_buf, vim_cmd_len, ascii);
+                    vim_cmd_len += 1;
+                }
+                continue;
+            }
+
+            # Normal mode commands
+            if (ascii == 58) { vim_in_colon = 1; vim_cmd_len = 0; continue; } # ':'
+            if (ascii == 105) { vim_insert = 1; continue; } # 'i'
+            if (ascii == 97)  { _cursor_move_right(); vim_insert = 1; continue; } # 'a'
+            if (ascii == 65)  { # 'A' — go to end of line then insert
+                while (edit_cursor < edit_buf_len) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor);
+                    if (c == 10) { break; }
+                    edit_cursor += 1;
+                }
+                vim_insert = 1;
+                continue;
+            }
+            if (ascii == 73) { # 'I' — go to start of line then insert
+                while (edit_cursor > 0) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor - 1);
+                    if (c == 10) { break; }
+                    edit_cursor -= 1;
+                }
+                vim_insert = 1;
+                continue;
+            }
+            if (ascii == 111) { # 'o' — open line below
+                while (edit_cursor < edit_buf_len) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor);
+                    if (c == 10) { edit_cursor += 1; break; }
+                    edit_cursor += 1;
+                }
+                _buf_insert(10);
+                edit_cursor -= 1;
+                vim_insert = 1;
+                continue;
+            }
+            # h j k l movement
+            if (ascii == 104) { _cursor_move_left();  continue; } # 'h'
+            if (ascii == 106) { _cursor_move_down();  continue; } # 'j'
+            if (ascii == 107) { _cursor_move_up();    continue; } # 'k'
+            if (ascii == 108) { _cursor_move_right(); continue; } # 'l'
+            # x = delete char at cursor
+            if (ascii == 120) { _buf_delete_at(); continue; }
+            # w = jump forward a word
+            if (ascii == 119) {
+                while (edit_cursor < edit_buf_len) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor);
+                    if (c == 32 || c == 10) { edit_cursor += 1; break; }
+                    edit_cursor += 1;
+                }
+                continue;
+            }
+            # b = jump back a word
+            if (ascii == 98) {
+                if (edit_cursor > 0) { edit_cursor -= 1; }
+                while (edit_cursor > 0) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor - 1);
+                    if (c == 32 || c == 10) { break; }
+                    edit_cursor -= 1;
+                }
+                continue;
+            }
+            # 0 = start of line
+            if (ascii == 48) {
+                while (edit_cursor > 0) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor - 1);
+                    if (c == 10) { break; }
+                    edit_cursor -= 1;
+                }
+                continue;
+            }
+            # $ = end of line
+            if (ascii == 36) {
+                while (edit_cursor < edit_buf_len) {
+                    var c = _edit_getch(EDIT_BUF, edit_cursor);
+                    if (c == 10) { break; }
+                    edit_cursor += 1;
+                }
+                continue;
+            }
+            continue;
+        }
+
+        # ── Vim Mode — Insert ──────────────────────────────────────────────
+        if (edit_mode == VIM_MODE && vim_insert != 0) {
+            # ESC exits insert mode
+            if (ascii == 27) { vim_insert = 0; if (edit_cursor > 0) { edit_cursor -= 1; } continue; }
+            if (ascii == 8)  { _buf_backspace(); continue; }
+            if (special == keyboard::KEY_DEL) { _buf_delete_at(); continue; }
+            if (ascii == 10 || ascii == 13) { _buf_insert(10); continue; }
+            if (ascii == 9) { _buf_insert(32); _buf_insert(32); _buf_insert(32); _buf_insert(32); continue; }
+            if (ascii >= 32 && ascii < 127) { _buf_insert(ascii); continue; }
+        }
+    }
+}

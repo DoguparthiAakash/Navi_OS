@@ -1,64 +1,89 @@
 #!/bin/bash
-# Navi OS Build Script
+# Navi OS Build Script - Pure Nux Edition
+# NO Python. NO assembly files. Everything built by the Nux compiler.
 
+set -e
 cd "$(dirname "$0")" || exit 1
 
-echo "Building Navi OS ISO..."
+# ─── Colors ────────────────────────────────────────────────────────────────
+BOLD='\033[1m'
+CYAN='\033[96m'
+GREEN='\033[92m'
+DIM='\033[2m'
+RESET='\033[0m'
 
-# The nuxc compiler uses the python transpiler to output an x86 object file
-cat > nuxc << 'EOF'
-#!/bin/bash
-echo "Transpiling Nux to x86 Assembly..."
-NUX_FILES=""
-for arg in "$@"; do
-    if [[ "$arg" == *.nux ]]; then
-        NUX_FILES="$NUX_FILES $arg"
-    fi
-done
-cat $NUX_FILES > all.nux
-python3 nux2c.py all.nux all.c
-gcc -m32 -ffreestanding -fno-pie -fno-stack-protector -Wno-int-conversion -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -c all.c -o kernel_nux.o
-EOF
-chmod +x nuxc
-export PATH=".:$PATH"
+echo -e "${BOLD}╭─ ◆ navi-os build ──────────────────────────────────────╮${RESET}"
+echo -e "${BOLD}│  Navi OS  ·  pure Nux compilation                      │${RESET}"
+echo -e "${BOLD}╰────────────────────────────────────────────────────────╯${RESET}"
 
-# 1. Assemble the bootloader
-echo "Assembling boot.s..."
-as --32 boot.s -o boot.o
+# ─── Find the nux binary ───────────────────────────────────────────────────
+# We need a Linux (ELF) build of nux since this runs inside WSL.
+NUX_SRC="$(dirname "$0")/../Nux_Lang/nux/nux_oleg/nux_dist"
+NUX_BIN_PATH="$NUX_SRC/target/release/nux"
 
-# 2. Compile Nux files into native object files
-echo "Compiling Pure Nux Kernel..."
-nuxc --target=i686-unknown-none --no-std memory.nux vga.nux keyboard.nux fs.nux ramfs.nux shell.nux kernel.nux -o kernel_nux.o
+if [ ! -f "$NUX_BIN_PATH" ]; then
+    echo -e "${DIM}  ├─ · Building Nux compiler from source...${RESET}"
+    (cd "$NUX_SRC" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release -q)
+fi
 
-# 3. Link everything together
-echo "Linking OS..."
+NUX_BIN="$NUX_BIN_PATH"
+if [ ! -f "$NUX_BIN" ]; then
+    echo -e "  ╰─ ✕ ${BOLD}Cannot find or build the nux compiler. Is cargo/rustup installed?${RESET}"
+    exit 1
+fi
+
+echo -e "${DIM}  ├─ · Using Nux compiler: $NUX_BIN${RESET}"
+
+# ─── Step 1: Compile the Nux OS source files into boot.o + kernel_nux.o ───
+echo -e "${DIM}  ├─ ✦ Compiling boot.nux → boot.o${RESET}"
+"$NUX_BIN" build-native boot.nux --output boot.o
+
+echo -e "${DIM}  ├─ ✦ Compiling kernel → kernel_nux.o${RESET}"
+"$NUX_BIN" build-native \
+    fs.nux \
+    ../Nux_Lang/lib/std/hw.nux \
+    ../Nux_Lang/lib/std/mem.nux \
+    ../Nux_Lang/lib/std/string.nux \
+    ../Nux_Lang/lib/std/io.nux \
+    ../Nux_Lang/lib/std/math.nux \
+    keyboard.nux \
+    ramfs.nux \
+    edit.nux \
+    fm.nux \
+    shell.nux \
+    kernel.nux \
+    --output kernel_nux.o
+
+# ─── Step 2: Link ─────────────────────────────────────────────────────────
+echo -e "${DIM}  ├─ · Linking Navi OS...${RESET}"
 ld -m elf_i386 -T linker.ld boot.o kernel_nux.o -o navi.bin -nostdlib
 
-echo "Verifying Multiboot header..."
+# ─── Step 3: Verify Multiboot ─────────────────────────────────────────────
+echo -e "${DIM}  ├─ · Verifying Multiboot header...${RESET}"
 if grub-file --is-x86-multiboot navi.bin; then
-  echo "Multiboot confirmed."
+  echo -e "${DIM}  ├─ ✦ Multiboot confirmed.${RESET}"
 else
-  echo "The file is not multiboot."
+  echo -e "  ╰─ ✕ ${BOLD}Error: navi.bin is not a valid Multiboot image.${RESET}"
   exit 1
 fi
 
-# 4. Generate RamFS (initrd.img)
-echo "Generating NuxFS Ramdisk..."
+# ─── Step 4: Generate RamFS ───────────────────────────────────────────────
+echo -e "${DIM}  ├─ · Generating NuxFS Ramdisk...${RESET}"
 mkdir -p ramfs_root
-echo "Welcome to Navi OS! This is a real file stored in NuxFS (RamFS)." > ramfs_root/readme.txt
-# In a real OS, we'd use `tar -cvf initrd.img -C ramfs_root .`
-# For this build script simulation, we just create a dummy file.
+echo "Welcome to Navi OS! Powered by the Nux language." > ramfs_root/readme.txt
 touch initrd.img
 
-# 5. Package into Bootable ISO
-echo "Packaging NaviOS.iso..."
+# ─── Step 5: Package ISO ──────────────────────────────────────────────────
+echo -e "${DIM}  ├─ · Packaging NaviOS.iso...${RESET}"
 mkdir -p isodir/boot/grub
 cp navi.bin isodir/boot/navi.bin
 cp initrd.img isodir/boot/initrd.img
 cp grub.cfg isodir/boot/grub/grub.cfg
 
-grub-mkrescue -o NaviOS.iso isodir
+grub-mkrescue -o NaviOS.iso isodir 2>/dev/null
 
-echo "Build successful! Boot image: NaviOS.iso"
-echo "Run with QEMU: qemu-system-i386 -cdrom NaviOS.iso"
-echo "Or load NaviOS.iso into VirtualBox."
+echo ""
+echo -e "${GREEN}${BOLD}  ╰─ ✦ Build successful!  NaviOS.iso${RESET}"
+echo -e "${DIM}     Run:  qemu-system-i386 -cdrom NaviOS.iso${RESET}"
+echo -e "${DIM}     Or load NaviOS.iso into VirtualBox.${RESET}"
+echo ""
