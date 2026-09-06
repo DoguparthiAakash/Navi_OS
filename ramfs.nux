@@ -173,15 +173,15 @@ func create_file(name: *u8, data: *u8, size: u32) -> u8 {
 
     # Store pointer into FILE_DATA_PTRS[slot] (4-byte aligned)
     var ptr_offset: u32 = slot * 4;
-    asm("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    asm("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
 
     # Store size
-    asm("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    asm("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
 
     # Mark slot as used
@@ -204,13 +204,13 @@ func write_file(name: *u8, data: *u8, size: u32) -> u8 {
     _copy_bytes(heap_ptr, data, size);
 
     var ptr_offset: u32 = slot * 4;
-    asm("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    asm("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
-    asm("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    asm("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
     return 1;
 }

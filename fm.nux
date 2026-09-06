@@ -206,7 +206,7 @@ func _prompt(msg: *u8) -> u8 {
 
 # ─── Public Entry Point ───────────────────────────────────────────────────────
 
-func open() {
+func filemanager_open() {
     keyboard::init_keymaps();
 
     fm_file_cursor = 0;
@@ -308,7 +308,7 @@ func open() {
             if (fm_focus == 0) {
                 var fname = ramfs::get_file_name_at(fm_file_cursor);
                 if (fname != 0) {
-                    edit::open(fname);
+                    edit::editor_open(fname);
                     io::clear();
                 }
             }
@@ -325,7 +325,7 @@ func open() {
                     _fm_render_status("Error: file already exists or too many files.");
                 } else {
                     # Open the new empty file in editor
-                    edit::open(PROMPT_BUF);
+                    edit::editor_open(PROMPT_BUF);
                     io::clear();
                 }
             }

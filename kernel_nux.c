@@ -600,6 +600,7 @@ uint8_t COLOR_LIGHT_CYAN = 11;
 uint8_t COLOR_LIGHT_RED = 12;
 uint8_t COLOR_LIGHT_MAGENTA = 13;
 uint8_t COLOR_LIGHT_BROWN = 14;
+uint8_t COLOR_YELLOW = 14;  // alias for LIGHT_BROWN
 uint8_t COLOR_WHITE = 15;
 
 // ─── VGA State ────────────────────────────────────────────────────────────────
@@ -1571,13 +1572,12 @@ void init_ramfs() {
     file_count = 0;
     dir_count = 0;
     file_heap_ptr = FILE_HEAP_BASE;
-
-    // Pre-populate a readme.txt
-    uint8_t* readme_content = "Welcome to Navi OS!\nPowered by the Nux language.\nType 'help' in the shell for commands.\n";
-    create_file("readme.txt", readme_content, 87);
+    // readme pre-population done at end of ramfs init (after create_file defined)
 }
 
 // ─── File Operations ──────────────────────────────────────────────────────────
+
+// (All file helpers defined here, before init_ramfs calls create_file)
 
 // Returns the file slot index or MAX_FILES if not found
 uint32_t _find_file(uint8_t* name) {
@@ -1635,15 +1635,15 @@ uint8_t create_file(uint8_t* name, uint8_t* data, uint32_t size) {
 
     // Store pointer into FILE_DATA_PTRS[slot] (4-byte aligned)
     uint32_t ptr_offset = slot * 4;
-    __asm__("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    __asm__("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
 
     // Store size
-    __asm__("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    __asm__("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
 
     // Mark slot as used
@@ -1666,13 +1666,13 @@ uint8_t write_file(uint8_t* name, uint8_t* data, uint32_t size) {
     _copy_bytes(heap_ptr, data, size);
 
     uint32_t ptr_offset = slot * 4;
-    __asm__("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    __asm__("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_DATA_PTRS), "r"(ptr_offset), "r"(heap_ptr) : "%eax");
-    __asm__("movl %1, %%eax\n\t"
-        "addl %2, %%eax\n\t"
-        "movl %3, (%%eax)\n\t"
+    __asm__("movl %0, %%eax\n\t"
+        "addl %1, %%eax\n\t"
+        "movl %2, (%%eax)\n\t"
         : : "r"(FILE_SIZES), "r"(ptr_offset), "r"(size) : "%eax");
     return 1;
 }
@@ -1809,6 +1809,13 @@ uint8_t* get_dir_name_at(uint32_t index) {
         i += 1;
     }
     return 0;
+}
+
+// ─── Post-init (called after all file helpers are defined) ───────────────────
+
+void populate_readme() {
+    uint8_t* readme_content = "Welcome to Navi OS!\nPowered by the Nux language.\nType 'help' in the shell for commands.\n";
+    create_file("readme.txt", readme_content, 87);
 }
 
 
@@ -2151,7 +2158,7 @@ uint8_t _execute_vim_cmd() {
 
 // ─── Public Entry Point ───────────────────────────────────────────────────────
 
-void open(uint8_t* filename) {
+void editor_open(uint8_t* filename) {
     init_keymaps();
 
     edit_filename = filename;
@@ -2570,7 +2577,7 @@ uint8_t _prompt(uint8_t* msg) {
 
 // ─── Public Entry Point ───────────────────────────────────────────────────────
 
-void open() {
+void filemanager_open() {
     init_keymaps();
 
     fm_file_cursor = 0;
@@ -2672,7 +2679,7 @@ void open() {
             if (fm_focus == 0) {
                 uint32_t fname = get_file_name_at(fm_file_cursor);
                 if (fname != 0) {
-                    open(fname);
+                    editor_open(fname);
                     clear();
                 }
             }
@@ -2689,7 +2696,7 @@ void open() {
                     _fm_render_status("Error: file already exists or too many files.");
                 } else {
                     // Open the new empty file in editor
-                    open(PROMPT_BUF);
+                    editor_open(PROMPT_BUF);
                     clear();
                 }
             }
@@ -2978,6 +2985,7 @@ void _cmd_help() {
 void start_shell() {
     init_keymaps();
     init_ramfs();
+    populate_readme();
 
     set_color(COLOR_LIGHT_CYAN, COLOR_BLACK);
     print("Welcome to Navi OS\n");
@@ -3007,7 +3015,7 @@ void start_shell() {
         } else if (eq(CMD_BUF, "ls")) {
             _cmd_ls();
         } else if (eq(CMD_BUF, "fm")) {
-            open();
+            filemanager_open();
         } else if (eq(CMD_BUF, "halt") || eq(CMD_BUF, "shutdown")) {
             set_color(COLOR_YELLOW, COLOR_BLACK);
             print("System halted. Goodbye.\n");
@@ -3027,7 +3035,7 @@ void start_shell() {
         } else if (starts_with(CMD_BUF, "rmdir ")) {
             _cmd_rmdir(CMD_BUF + 6);
         } else if (starts_with(CMD_BUF, "edit ")) {
-            open(CMD_BUF + 5);
+            editor_open(CMD_BUF + 5);
             clear();
         } else {
             set_color(COLOR_LIGHT_RED, COLOR_BLACK);
