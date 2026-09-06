@@ -1,0 +1,50 @@
+@[no_std]
+
+import fs;
+
+# ramfs.nux - Initial RAM File System
+# This module reads an archive loaded into memory by GRUB.
+# GRUB passes the address of boot modules via the Multiboot struct.
+
+# Hardcoded for the demo: We assume the initrd module is loaded at 0x01000000
+# and it contains a flat sequence of files: [Name (16 bytes)][Size (4 bytes)][Data (Size bytes)]
+
+var INITRD_BASE: *u8 = 0x01000000;
+var MAX_FILES: u32 = 10;
+var root_files: *fs::File = 0x01100000; # Static allocation for file nodes
+var root_file_count: u32 = 0;
+
+var root_dir: fs::Directory;
+
+func init_ramfs() {
+    # In a real OS, we read the multiboot information struct.
+    # For now, we mock parsing an archive from INITRD_BASE.
+    
+    # We will simulate that there is one file "readme.txt" pre-loaded
+    # at INITRD_BASE by our build script.
+    
+    # Mocking the parsed structure for the shell to use
+    var readme_name: *u8 = "readme.txt";
+    var readme_data: *u8 = "Welcome to Navi OS!\nThis is a real file stored in NuxFS (RamFS).\n";
+    var readme_size: u32 = 65; # Length of the string above
+    
+    # We simulate populating the root_files array
+    # root_files[0].init(readme_name, readme_data, readme_size);
+    # Since we can't do array syntax easily without std::collections:
+    asm("
+        mov %1, %%eax
+        mov %%eax, 0(%0)
+        mov %2, %%eax
+        mov %%eax, 4(%0)
+        mov %3, %%eax
+        mov %%eax, 8(%0)
+    " : : "r"(root_files), "r"(readme_name), "r"(readme_data), "r"(readme_size) : "%eax");
+    
+    root_file_count = 1;
+    
+    root_dir.init("/", root_files, root_file_count);
+}
+
+func get_root() -> fs::Directory {
+    return root_dir;
+}

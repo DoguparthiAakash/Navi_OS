@@ -1,0 +1,142 @@
+@[no_std]
+
+import vga;
+import keyboard;
+import ramfs;
+
+# A very minimal string comparison for the shell
+func strcmp(s1: *u8, s2: *u8) -> bool {
+    var i: u32 = 0;
+    while (true) {
+        var c1: u8 = 0;
+        var c2: u8 = 0;
+        asm("mov %1, %%eax; movb (%%eax), %%cl; mov %%cl, %0" : "=r"(c1) : "r"(s1 + i) : "%eax", "%ecx");
+        asm("mov %1, %%eax; movb (%%eax), %%cl; mov %%cl, %0" : "=r"(c2) : "r"(s2 + i) : "%eax", "%ecx");
+        
+        if (c1 != c2) { return false; }
+        if (c1 == 0) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+# Starts with prefix comparison
+func starts_with(s1: *u8, prefix: *u8) -> bool {
+    var i: u32 = 0;
+    while (true) {
+        var c1: u8 = 0;
+        var c2: u8 = 0;
+        asm("mov %1, %%eax; movb (%%eax), %%cl; mov %%cl, %0" : "=r"(c1) : "r"(s1 + i) : "%eax", "%ecx");
+        asm("mov %1, %%eax; movb (%%eax), %%cl; mov %%cl, %0" : "=r"(c2) : "r"(prefix + i) : "%eax", "%ecx");
+        
+        if (c2 == 0) { return true; } # Reached end of prefix
+        if (c1 != c2) { return false; }
+        if (c1 == 0) { return false; }
+        i += 1;
+    }
+    return false;
+}
+
+func start_shell() {
+    vga::print("Welcome to Navi OS\n");
+    vga::print("Type 'help' for commands.\n\n");
+    
+    # Initialize the RamFS
+    ramfs::init_ramfs();
+    var root = ramfs::get_root();
+    
+    var cmd_buffer: *u8 = 0x200000;
+    
+    while (true) {
+        vga::print("root@navi:~# ");
+        
+        var buf_idx: u32 = 0;
+        var cmd_ready = false;
+        
+        while (!cmd_ready) {
+            var scancode = keyboard::get_scancode();
+            var ascii = keyboard::scancode_to_ascii(scancode);
+            
+            if (ascii != 0) {
+                if (ascii == 10) { # Enter
+                    vga::print_char(10);
+                    asm("movb $0, (%0)" : : "r"(cmd_buffer + buf_idx));
+                    cmd_ready = true;
+                } else {
+                    vga::print_char(ascii);
+                    asm("movb %b1, (%0)" : : "r"(cmd_buffer + buf_idx), "q"(ascii));
+                    buf_idx += 1;
+                }
+            }
+        }
+        
+        if (buf_idx == 0) {
+            continue;
+        }
+        
+        if (strcmp(cmd_buffer, "help")) {
+            vga::print("Commands: ls, cat [file], echo [msg], uname, whoami, clear, halt\n");
+        } else if (strcmp(cmd_buffer, "ls")) {
+            var i: u32 = 0;
+            while (i < root.file_count) {
+                var fname: *u8 = 0;
+                # root.files[i].name
+                asm("
+                    mov %1, %%eax
+                    mov %%eax, %%edx
+                    mov 0(%%edx), %%eax
+                    mov %%eax, %0
+                " : "=r"(fname) : "r"(root.files + (i * 12)) : "%eax", "%edx");
+                vga::print(fname);
+                vga::print("  ");
+                i += 1;
+            }
+            vga::print("\n");
+        } else if (starts_with(cmd_buffer, "cat ")) {
+            # Extract filename (skip "cat ")
+            var fname: *u8 = cmd_buffer + 4;
+            var i: u32 = 0;
+            var found = false;
+            while (i < root.file_count) {
+                var curr_name: *u8 = 0;
+                var curr_data: *u8 = 0;
+                asm("
+                    mov %2, %%eax
+                    mov 0(%%eax), %%edx
+                    mov %%edx, %0
+                    mov 4(%%eax), %%edx
+                    mov %%edx, %1
+                " : "=r"(curr_name), "=r"(curr_data) : "r"(root.files + (i * 12)) : "%eax", "%edx");
+                
+                if (strcmp(fname, curr_name)) {
+                    vga::print(curr_data);
+                    vga::print("\n");
+                    found = true;
+                    break;
+                }
+                i += 1;
+            }
+            if (!found) {
+                vga::print("cat: ");
+                vga::print(fname);
+                vga::print(": No such file or directory\n");
+            }
+        } else if (starts_with(cmd_buffer, "echo ")) {
+            vga::print(cmd_buffer + 5);
+            vga::print("\n");
+        } else if (strcmp(cmd_buffer, "uname") || strcmp(cmd_buffer, "uname -a")) {
+            vga::print("Navi OS 1.0.0 i686 (Pure Nux Kernel)\n");
+        } else if (strcmp(cmd_buffer, "whoami")) {
+            vga::print("root\n");
+        } else if (strcmp(cmd_buffer, "clear")) {
+            vga::clear_screen();
+        } else if (strcmp(cmd_buffer, "halt")) {
+            vga::print("System halted.\n");
+            asm("cli; hlt");
+        } else {
+            vga::print("bash: ");
+            vga::print(cmd_buffer);
+            vga::print(": command not found\n");
+        }
+    }
+}

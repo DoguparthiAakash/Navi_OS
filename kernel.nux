@@ -1,0 +1,19 @@
+@[no_std]
+
+import vga;
+import shell;
+import fs;
+import ramfs;
+
+# The entry point called by boot.s
+@[entry]
+func kmain() {
+    # Initialize hardware drivers
+    vga::clear_screen();
+    
+    # Hand off execution to the interactive shell
+    shell::start_shell();
+    
+    # We should never return here, but just in case:
+    asm("cli; hlt");
+}

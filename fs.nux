@@ -1,0 +1,15 @@
+@[no_std]
+
+# fs.nux - Virtual File System structures
+
+class File {
+    var name: *u8;
+    var data: *u8;
+    var size: u32;
+}
+
+class Directory {
+    var name: *u8;
+    var files: *File; # Pointer to array of files for now
+    var file_count: u32;
+}

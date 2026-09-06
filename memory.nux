@@ -1,0 +1,25 @@
+@[no_std]
+
+# memory.nux
+# Basic bump allocator for Navi OS
+
+var heap_start: u32 = 0x1000000; # 16 MB mark
+var heap_current: u32 = 0x1000000;
+
+func alloc(size: u32) -> *u8 {
+    var ptr: u32 = heap_current;
+    
+    # Align to 4 bytes
+    var remainder: u32 = size % 4;
+    if (remainder != 0) {
+        size = size + (4 - remainder);
+    }
+    
+    heap_current = heap_current + size;
+    return ptr as *u8;
+}
+
+func free(ptr: *u8) {
+    # Bump allocator doesn't free.
+    # In a real OS, implement a linked list or buddy allocator.
+}

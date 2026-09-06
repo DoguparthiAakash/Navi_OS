@@ -1,0 +1,11 @@
+#!/bin/bash
+echo "Transpiling Nux to x86 Assembly..."
+NUX_FILES=""
+for arg in "$@"; do
+    if [[ "$arg" == *.nux ]]; then
+        NUX_FILES="$NUX_FILES $arg"
+    fi
+done
+cat $NUX_FILES > all.nux
+python3 nux2c.py all.nux all.c
+gcc -m32 -ffreestanding -fno-pie -fno-stack-protector -Wno-int-conversion -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -c all.c -o kernel_nux.o
