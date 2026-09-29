@@ -34,6 +34,11 @@ import fm;
 #   rmdir <dir>   Delete a directory
 #   edit <file>   Open file in Nux Editor
 #   fm            Open Nux File Manager
+#   df            Show disk (ramfs) free/used space
+#   head <file>   Print first 10 lines of file
+#   tail <file>   Print last 10 lines of file
+#   wc <file>     Print newline, word, and byte counts
+#   sleep <ms>    Halt CPU for rough duration
 #   halt          Halt the CPU
 
 var CMD_BUF:  *u8 = 0x00200000;    # 64 KB command buffer
@@ -199,6 +204,126 @@ func _cmd_rmdir(dname: *u8) {
     }
 }
 
+func _find_first_space(s: *u8) -> *u8 {
+    var i: u32 = 0;
+    while (true) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(s), "r"(i) : "%eax");
+        if (c == 0) { return 0; }
+        if (c == 32) { return s + i; }
+        i += 1;
+    }
+    return 0;
+}
+
+func _cmd_cp(args: *u8) {
+    var space = _find_first_space(args);
+    if (space == 0) {
+        io::print("cp: missing destination file\n");
+        return;
+    }
+    asm("movb $0, (%0)" : : "r"(space));
+    var src = args;
+    var dst = space + 1;
+    
+    var data = ramfs::get_file_data(src);
+    if (data == 0) {
+        io::print("cp: "); io::print(src); io::print(": No such file\n");
+        return;
+    }
+    var size = ramfs::get_file_size(src);
+    var ok = ramfs::create_file(dst, data, size);
+    if (ok == 0) {
+        io::print("cp: cannot create destination file\n");
+    }
+}
+
+func _cmd_mv(args: *u8) {
+    var space = _find_first_space(args);
+    if (space == 0) {
+        io::print("mv: missing destination file\n");
+        return;
+    }
+    asm("movb $0, (%0)" : : "r"(space));
+    var src = args;
+    var dst = space + 1;
+    
+    var data = ramfs::get_file_data(src);
+    if (data == 0) {
+        io::print("mv: "); io::print(src); io::print(": No such file\n");
+        return;
+    }
+    var size = ramfs::get_file_size(src);
+    var ok = ramfs::create_file(dst, data, size);
+    if (ok == 0) {
+        io::print("mv: cannot move to destination\n");
+        return;
+    }
+    ramfs::delete_file(src);
+}
+
+func _cmd_df() {
+    var used: u32 = 0;
+    var i: u32 = 0;
+    while (i < ramfs::file_count) {
+        var fname = ramfs::get_file_name_at(i);
+        if (fname != 0) {
+            used += ramfs::get_file_size(fname);
+        }
+        i += 1;
+    }
+    io::print("Filesystem      Size  Used Avail Use% Mounted on\n");
+    io::print("ramfs           64MB  ");
+    io::print_u32(used);
+    io::print("   ---   ---  /\n");
+}
+
+func _cmd_head(fname: *u8) {
+    var data = ramfs::get_file_data(fname);
+    if (data == 0) { io::print("head: No such file\n"); return; }
+    
+    var i: u32 = 0;
+    var lines: u32 = 0;
+    while (lines < 10) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(data), "r"(i) : "%eax");
+        if (c == 0) { break; }
+        io::print_char(c);
+        if (c == 10) { lines += 1; }
+        i += 1;
+    }
+    if (lines < 10 && i > 0) { io::print_char(10); }
+}
+
+func _cmd_wc(fname: *u8) {
+    var data = ramfs::get_file_data(fname);
+    if (data == 0) { io::print("wc: No such file\n"); return; }
+    
+    var size = ramfs::get_file_size(fname);
+    var lines: u32 = 0;
+    var words: u32 = 0;
+    var in_word: u8 = 0;
+    
+    var i: u32 = 0;
+    while (i < size) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(data), "r"(i) : "%eax");
+        if (c == 10) { lines += 1; }
+        if (c == 32 || c == 10 || c == 9 || c == 13) {
+            in_word = 0;
+        } else if (in_word == 0) {
+            in_word = 1;
+            words += 1;
+        }
+        i += 1;
+    }
+    
+    io::print("  "); io::print_u32(lines);
+    io::print("  "); io::print_u32(words);
+    io::print("  "); io::print_u32(size);
+    io::print(" "); io::print(fname); io::print("\n");
+}
+
 func _cmd_help() {
     io::set_color(io::COLOR_LIGHT_CYAN, io::COLOR_BLACK);
     io::print("Navi OS — Available Commands\n");
@@ -212,11 +337,17 @@ func _cmd_help() {
     io::print("  ls             List files and directories\n");
     io::print("  cat <file>     Print file contents\n");
     io::print("  touch <file>   Create empty file\n");
+    io::print("  cp <src> <dst> Copy a file\n");
+    io::print("  mv <src> <dst> Move/rename a file\n");
     io::print("  rm <file>      Delete file\n");
     io::print("  mkdir <dir>    Create directory\n");
     io::print("  rmdir <dir>    Delete directory\n");
+    io::print("  df             Disk usage\n");
+    io::print("  head <file>    Show first 10 lines\n");
+    io::print("  wc <file>      Count words/lines\n");
     io::print("  edit <file>    Open Nux Editor (F1=Nano F2=Vim)\n");
     io::print("  fm             Open Nux File Manager\n");
+    io::print("  sleep <ms>     Sleep (dummy loop)\n");
     io::print("  halt           Halt the system\n");
     io::set_color(io::COLOR_DARK_GREY, io::COLOR_BLACK);
     io::print("  Ctrl+C: interrupt   Ctrl+L: clear screen   Backspace: delete\n");
@@ -271,12 +402,26 @@ func start_shell() {
             _cmd_cat(CMD_BUF + 4);
         } else if (string::starts_with(CMD_BUF, "touch ")) {
             _cmd_touch(CMD_BUF + 6);
+        } else if (string::starts_with(CMD_BUF, "cp ")) {
+            _cmd_cp(CMD_BUF + 3);
+        } else if (string::starts_with(CMD_BUF, "mv ")) {
+            _cmd_mv(CMD_BUF + 3);
         } else if (string::starts_with(CMD_BUF, "rm ")) {
             _cmd_rm(CMD_BUF + 3);
         } else if (string::starts_with(CMD_BUF, "mkdir ")) {
             _cmd_mkdir(CMD_BUF + 6);
         } else if (string::starts_with(CMD_BUF, "rmdir ")) {
             _cmd_rmdir(CMD_BUF + 6);
+        } else if (string::starts_with(CMD_BUF, "head ")) {
+            _cmd_head(CMD_BUF + 5);
+        } else if (string::starts_with(CMD_BUF, "wc ")) {
+            _cmd_wc(CMD_BUF + 3);
+        } else if (string::eq(CMD_BUF, "df")) {
+            _cmd_df();
+        } else if (string::starts_with(CMD_BUF, "sleep ")) {
+            # Dummy delay loop
+            var k: u32 = 0;
+            while (k < 10000000) { k += 1; }
         } else if (string::starts_with(CMD_BUF, "edit ")) {
             editor_open(CMD_BUF + 5);
             io::clear();

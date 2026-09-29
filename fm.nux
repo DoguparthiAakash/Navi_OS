@@ -21,7 +21,7 @@ import edit;
 #   n           New file (prompt for name)
 #   m           New directory (prompt for name)
 #   d / Del     Delete selected file or directory
-#   r           Rename (not yet — future)
+#   r           Rename selected file or directory
 #   Tab         Switch focus between files / dirs panels
 #   q / Esc     Quit file manager
 
@@ -81,7 +81,7 @@ func _fm_render_separator() {
 func _fm_render_shortcuts() {
     io::set_color(io::COLOR_BLACK, io::COLOR_LIGHT_GREY);
     io::clear_row(24);
-    io::print_at("n=NewFile  m=NewDir  d=Delete  Enter=Open/Edit  Tab=Panel  q=Quit", 0, 24);
+    io::print_at("n=NewFile m=NewDir d=Del r=Rename Enter=Open/Edit Tab=Panel q=Quit", 0, 24);
     io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
 }
 
@@ -376,6 +376,40 @@ func filemanager_open() {
                     if (conf_ch == 121 || conf_ch == 89) {
                         ramfs::delete_dir(dname);
                         if (fm_dir_cursor > 0) { fm_dir_cursor -= 1; }
+                    }
+                }
+            }
+            continue;
+        }
+
+        # ── r: rename ──────────────────────────────────────────────────────
+        if (ascii == 114) { # 'r'
+            if (fm_focus == 0) {
+                var fname = ramfs::get_file_name_at(fm_file_cursor);
+                if (fname != 0) {
+                    var ok = _prompt("Rename file to: ");
+                    if (ok != 0 && prompt_len > 0) {
+                        var data = ramfs::get_file_data(fname);
+                        var size = ramfs::get_file_size(fname);
+                        var res = ramfs::create_file(PROMPT_BUF, data, size);
+                        if (res != 0) {
+                            ramfs::delete_file(fname);
+                        } else {
+                            _fm_render_status("Error: cannot rename file.");
+                        }
+                    }
+                }
+            } else {
+                var dname = ramfs::get_dir_name_at(fm_dir_cursor);
+                if (dname != 0) {
+                    var ok = _prompt("Rename dir to: ");
+                    if (ok != 0 && prompt_len > 0) {
+                        var res = ramfs::create_dir(PROMPT_BUF);
+                        if (res != 0) {
+                            ramfs::delete_dir(dname);
+                        } else {
+                            _fm_render_status("Error: cannot rename directory.");
+                        }
                     }
                 }
             }
