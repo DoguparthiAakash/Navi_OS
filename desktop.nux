@@ -1,0 +1,33 @@
+@[no_std]
+import std::io;
+
+# ─── desktop.nux — Graphical Desktop Interface Stub ───────────────────────────
+#
+# To achieve a true Desktop environment, the following must be implemented:
+# 1. Multiboot VBE initialization (FrameBuffer instead of VGA text mode)
+# 2. Pixel drawing routines (put_pixel, draw_rect, draw_line)
+# 3. Font rendering (bitmap fonts, e.g., PC Screen Font / PSF)
+# 4. A Window Manager (compositor, Z-order, clipping)
+# 5. Mouse driver (PS/2 or USB HID)
+
+var desktop_active: u8 = 0;
+
+func init_desktop() {
+    # Currently a stub. In the future, this will switch from VGA to VBE Framebuffer.
+    io::print("Initializing Graphical Desktop Environment...\n");
+    io::print("Loading Display Server...\n");
+    io::print("Loading Window Manager...\n");
+    desktop_active = 1;
+}
+
+func draw_window(title: *u8, x: u32, y: u32, w: u32, h: u32) {
+    # Stub for window drawing
+}
+
+func start_desktop_mode() {
+    init_desktop();
+    io::print("\n[ERROR]: Missing VESA/VBE Framebuffer Graphics Driver!\n");
+    io::print("Navi OS is currently running in VGA Text Mode (80x25 characters).\n");
+    io::print("To use the Desktop GUI, Mesa drivers and a linear framebuffer are required.\n");
+    desktop_active = 0;
+}

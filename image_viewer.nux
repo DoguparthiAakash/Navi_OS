@@ -1,0 +1,32 @@
+@[no_std]
+import std::io;
+import desktop;
+
+# ─── image_viewer.nux — Photo Viewer App Stub ─────────────────────────────────
+#
+# A program to view images inside the shell / desktop mode, supporting:
+# - Zoom in / Zoom out
+# - Panning (Right/Left/Top/Bottom)
+#
+# Requires:
+# 1. Image decoding libraries (PNG, JPEG, BMP)
+# 2. Framebuffer Graphics (VBE)
+
+func open_image(filepath: *u8) {
+    io::set_color(io::COLOR_LIGHT_MAGENTA, io::COLOR_BLACK);
+    io::print("--- Navi Photo Viewer ---\n");
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+    
+    io::print("Opening image: ");
+    io::print(filepath);
+    io::print("\n");
+    
+    if (desktop::desktop_active == 0) {
+        io::print("[ERROR]: Cannot display image in VGA Text Mode!\n");
+        io::print("Please switch to graphical Desktop Mode first.\n");
+        return;
+    }
+    
+    io::print("Controls: [+] Zoom In  [-] Zoom Out  [Arrow Keys] Pan Image\n");
+    # Image decoding and framebuffer blitting logic would go here.
+}

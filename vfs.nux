@@ -1,0 +1,267 @@
+@[no_std]
+import std::io;
+import std::string;
+
+# ─── vfs.nux — Virtual File System (VFS) Layer ────────────────────────────────
+#
+# The VFS is an abstraction layer that allows different filesystems (ramfs,
+# ext2, fat32, etc.) to be mounted at different points in a unified directory
+# tree. All user-facing file operations go through the VFS.
+#
+# Architecture:
+#   vfs_mount[]        — mount table (which fs is at which path)
+#   vfs_node[]         — inode table (represents files/dirs across all fs)
+#
+# VFS Node layout (stored at VFS_NODES_BASE, 64 bytes per node):
+#   +0:  name[32]      — filename (null-terminated, max 31 chars)
+#   +32: type          — 0=file, 1=directory, 2=symlink
+#   +36: size          — file size in bytes
+#   +40: fs_id         — which filesystem owns this node (0=ramfs, 1=ext2...)
+#   +44: fs_inode      — inode number in the owning filesystem
+#   +48: parent_idx    — index of parent directory node
+#   +52: flags         — permission/attribute flags
+#   +56: reserved[8]   — (padding to 64 bytes)
+#
+# Mount table (stored at VFS_MOUNTS_BASE, 48 bytes per entry):
+#   +0:  path[32]      — mount point path (e.g. "/", "/tmp", "/dev")
+#   +32: fs_id         — filesystem type ID
+#   +36: flags         — mount flags (read-only, etc.)
+#   +40: reserved[8]
+
+var VFS_MAX_NODES:  u32 = 256;
+var VFS_MAX_MOUNTS: u32 = 8;
+var VFS_NODE_SIZE:  u32 = 64;
+var VFS_MOUNT_SIZE: u32 = 48;
+
+# Memory layout (above pit/thread allocations)
+var VFS_NODES_BASE:  *u8 = 0x01800000;   # 256 * 64 = 16384 bytes
+var VFS_MOUNTS_BASE: *u8 = 0x01804100;   # 8 * 48   = 384 bytes
+
+# Node field offsets
+var VN_NAME:        u32 = 0;
+var VN_TYPE:        u32 = 32;
+var VN_SIZE:        u32 = 36;
+var VN_FSID:        u32 = 40;
+var VN_INODE:       u32 = 44;
+var VN_PARENT:      u32 = 48;
+var VN_FLAGS:       u32 = 52;
+
+# Node types
+var VN_FILE: u32 = 0;
+var VN_DIR:  u32 = 1;
+var VN_LINK: u32 = 2;
+
+# Filesystem IDs
+var FSID_NONE:  u32 = 0xFFFFFFFF;
+var FSID_RAMFS: u32 = 0;
+var FSID_EXT2:  u32 = 1;
+
+var vfs_node_count:  u32 = 0;
+var vfs_mount_count: u32 = 0;
+
+# ─── Low-level node field accessors ───────────────────────────────────────────
+func _vn_write_u32(node_idx: u32, field: u32, val: u32) {
+    var offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE), "r"(field));
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(VFS_NODES_BASE), "r"(offset), "r"(val) : "%eax");
+}
+
+func _vn_read_u32(node_idx: u32, field: u32) -> u32 {
+    var offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE), "r"(field));
+    var val: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(val) : "r"(VFS_NODES_BASE), "r"(offset) : "%eax");
+    return val;
+}
+
+func _vn_name_ptr(node_idx: u32) -> *u8 {
+    var offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE));
+    var ptr: *u8 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t"
+        : "=r"(ptr) : "r"(VFS_NODES_BASE), "r"(offset));
+    return ptr;
+}
+
+func _vn_copy_name(node_idx: u32, name: *u8) {
+    var dst = _vn_name_ptr(node_idx);
+    var i: u32 = 0;
+    while (i < 31) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(name), "r"(i) : "%eax");
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(i), "q"(c));
+        if (c == 0) { break; }
+        i += 1;
+    }
+    # Always null-terminate at byte 31
+    var null_byte: u8 = 0;
+    var max_idx: u32 = 31;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(max_idx), "q"(null_byte));
+}
+
+# ─── Initialize VFS ───────────────────────────────────────────────────────────
+func init_vfs() {
+    # Zero out node and mount tables
+    var i: u32 = 0;
+    while (i < VFS_MAX_NODES * VFS_NODE_SIZE) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(VFS_NODES_BASE), "r"(i));
+        i += 1;
+    }
+    i = 0;
+    while (i < VFS_MAX_MOUNTS * VFS_MOUNT_SIZE) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(VFS_MOUNTS_BASE), "r"(i));
+        i += 1;
+    }
+
+    # Create root directory node "/"
+    _vn_copy_name(0, "/");
+    _vn_write_u32(0, VN_TYPE,   VN_DIR);
+    _vn_write_u32(0, VN_SIZE,   0);
+    _vn_write_u32(0, VN_FSID,   FSID_RAMFS);
+    _vn_write_u32(0, VN_INODE,  0);
+    _vn_write_u32(0, VN_PARENT, 0);  # root's parent is itself
+    _vn_write_u32(0, VN_FLAGS,  0x755);
+
+    vfs_node_count = 1;
+
+    io::print("[vfs] Initialized. Root node mounted at /\n");
+}
+
+# ─── Create a file node in the VFS ────────────────────────────────────────────
+func vfs_create_file(name: *u8, parent_idx: u32, fs_id: u32, fs_inode: u32, size: u32) -> u32 {
+    if (vfs_node_count >= VFS_MAX_NODES) { return 0xFFFFFFFF; }
+    var idx = vfs_node_count;
+    _vn_copy_name(idx, name);
+    _vn_write_u32(idx, VN_TYPE,   VN_FILE);
+    _vn_write_u32(idx, VN_SIZE,   size);
+    _vn_write_u32(idx, VN_FSID,   fs_id);
+    _vn_write_u32(idx, VN_INODE,  fs_inode);
+    _vn_write_u32(idx, VN_PARENT, parent_idx);
+    _vn_write_u32(idx, VN_FLAGS,  0x644);
+    vfs_node_count += 1;
+    return idx;
+}
+
+# ─── Create a directory node in the VFS ───────────────────────────────────────
+func vfs_create_dir(name: *u8, parent_idx: u32, fs_id: u32) -> u32 {
+    if (vfs_node_count >= VFS_MAX_NODES) { return 0xFFFFFFFF; }
+    var idx = vfs_node_count;
+    _vn_copy_name(idx, name);
+    _vn_write_u32(idx, VN_TYPE,   VN_DIR);
+    _vn_write_u32(idx, VN_SIZE,   0);
+    _vn_write_u32(idx, VN_FSID,   fs_id);
+    _vn_write_u32(idx, VN_INODE,  idx);
+    _vn_write_u32(idx, VN_PARENT, parent_idx);
+    _vn_write_u32(idx, VN_FLAGS,  0x755);
+    vfs_node_count += 1;
+    return idx;
+}
+
+# ─── Find a node by name in a parent directory ────────────────────────────────
+func vfs_find(parent_idx: u32, name: *u8) -> u32 {
+    var i: u32 = 0;
+    while (i < vfs_node_count) {
+        var parent = _vn_read_u32(i, VN_PARENT);
+        if (parent == parent_idx && i != 0) {
+            var node_name = _vn_name_ptr(i);
+            if (string::eq(node_name, name)) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return 0xFFFFFFFF; # Not found
+}
+
+# ─── List directory contents ───────────────────────────────────────────────────
+func vfs_ls(parent_idx: u32) {
+    io::set_color(io::COLOR_LIGHT_CYAN, io::COLOR_BLACK);
+    io::print("VFS Contents of node ");
+    io::print_u32(parent_idx);
+    io::print(":\n");
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+
+    var found: u32 = 0;
+    var i: u32 = 0;
+    while (i < vfs_node_count) {
+        var parent = _vn_read_u32(i, VN_PARENT);
+        var type_  = _vn_read_u32(i, VN_TYPE);
+        if (parent == parent_idx && i != parent_idx) {
+            var node_name = _vn_name_ptr(i);
+            if (type_ == VN_DIR) {
+                io::set_color(io::COLOR_LIGHT_BLUE, io::COLOR_BLACK);
+                io::print("  [DIR]  ");
+            } else {
+                io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+                io::print("  [FILE] ");
+            }
+            io::print(node_name);
+            if (type_ == VN_FILE) {
+                io::print("  (");
+                io::print_u32(_vn_read_u32(i, VN_SIZE));
+                io::print(" bytes)");
+            }
+            io::print_char(10);
+            io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+            found += 1;
+        }
+        i += 1;
+    }
+    if (found == 0) {
+        io::print("  (empty)\n");
+    }
+}
+
+# ─── Print full VFS tree ───────────────────────────────────────────────────────
+func vfs_tree() {
+    io::set_color(io::COLOR_LIGHT_CYAN, io::COLOR_BLACK);
+    io::print("/\n");
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+    var i: u32 = 1;
+    while (i < vfs_node_count) {
+        var type_ = _vn_read_u32(i, VN_TYPE);
+        var name  = _vn_name_ptr(i);
+        io::print("  ");
+        if (type_ == VN_DIR) {
+            io::set_color(io::COLOR_LIGHT_BLUE, io::COLOR_BLACK);
+            io::print(name);
+            io::print("/");
+        } else {
+            io::print(name);
+        }
+        io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+        io::print_char(10);
+        i += 1;
+    }
+}
+
+# ─── Populate standard Unix directory tree ────────────────────────────────────
+func vfs_populate_tree() {
+    # Standard Unix hierarchy
+    vfs_create_dir("bin",  0, FSID_RAMFS);   # Binaries
+    vfs_create_dir("dev",  0, FSID_RAMFS);   # Devices
+    vfs_create_dir("etc",  0, FSID_RAMFS);   # Config
+    vfs_create_dir("home", 0, FSID_RAMFS);   # User homes
+    vfs_create_dir("proc", 0, FSID_RAMFS);   # Process info
+    vfs_create_dir("tmp",  0, FSID_RAMFS);   # Temp files
+    vfs_create_dir("usr",  0, FSID_RAMFS);   # User programs
+    vfs_create_dir("var",  0, FSID_RAMFS);   # Variable data
+
+    # /etc/navi.conf  (example config file)
+    var etc_idx = vfs_find(0, "etc");
+    if (etc_idx != 0xFFFFFFFF) {
+        vfs_create_file("navi.conf", etc_idx, FSID_RAMFS, 1, 64);
+    }
+
+    # /home/root
+    var home_idx = vfs_find(0, "home");
+    if (home_idx != 0xFFFFFFFF) {
+        vfs_create_dir("root", home_idx, FSID_RAMFS);
+    }
+}

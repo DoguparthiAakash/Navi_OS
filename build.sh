@@ -48,11 +48,23 @@ echo -e "${DIM}  ├─ ✦ Compiling kernel → kernel_nux.o${RESET}"
     ../Nux_Lang/lib/std/math.nux \
     keyboard.nux \
     ramfs.nux \
+    process.nux \
+    memory.nux \
+    disk.nux \
+    pit.nux \
+    thread.nux \
+    vfs.nux \
+    fb.nux \
+    font.nux \
+    gui.nux \
+    desktop.nux \
+    image_viewer.nux \
     edit.nux \
     fm.nux \
     shell.nux \
     kernel.nux \
     --output kernel_nux.o
+
 
 # ─── Step 2: Link ─────────────────────────────────────────────────────────
 echo -e "${DIM}  ├─ · Linking Navi OS...${RESET}"

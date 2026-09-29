@@ -1,0 +1,85 @@
+@[no_std]
+import std::hw;
+
+# ─── disk.nux — Disk Management (ATA PIO) ────────────────────────────────────
+#
+# Very basic ATA PIO driver to read/write sectors from the primary IDE bus.
+# Real disk management would use interrupts, DMA, and a file system driver.
+
+var ATA_PRIMARY_DATA: u16 = 0x1F0;
+var ATA_PRIMARY_ERR:  u16 = 0x1F1;
+var ATA_PRIMARY_SEC:  u16 = 0x1F2;
+var ATA_PRIMARY_LBA_LO: u16 = 0x1F3;
+var ATA_PRIMARY_LBA_MID: u16 = 0x1F4;
+var ATA_PRIMARY_LBA_HI: u16 = 0x1F5;
+var ATA_PRIMARY_DRV:  u16 = 0x1F6;
+var ATA_PRIMARY_CMD:  u16 = 0x1F7;
+var ATA_PRIMARY_STAT: u16 = 0x1F7;
+
+# Wait until the drive is ready
+func ata_wait_ready() {
+    while (true) {
+        var status = hw::inb(ATA_PRIMARY_STAT);
+        # Wait until BSY (bit 7) is clear and RDY (bit 6) is set
+        if ((status & 0x80) == 0 && (status & 0x40) != 0) {
+            break;
+        }
+    }
+}
+
+# Read a 512-byte sector using ATA PIO mode
+func read_sector(lba: u32, buffer: *u8) {
+    hw::outb(ATA_PRIMARY_DRV, (0xE0 | ((lba >> 24) & 0x0F)) as u8);
+    hw::outb(ATA_PRIMARY_SEC, 1);
+    hw::outb(ATA_PRIMARY_LBA_LO, (lba & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_CMD, 0x20); # Read with retry
+
+    ata_wait_ready();
+
+    var i: u32 = 0;
+    while (i < 256) {
+        var word = hw::inw(ATA_PRIMARY_DATA);
+        
+        # Store low byte
+        var lo: u8 = (word & 0xFF) as u8;
+        var offset1 = i * 2;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buffer), "r"(offset1), "q"(lo));
+        
+        # Store high byte
+        var hi: u8 = ((word >> 8) & 0xFF) as u8;
+        var offset2 = i * 2 + 1;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buffer), "r"(offset2), "q"(hi));
+        
+        i += 1;
+    }
+}
+
+# Write a 512-byte sector using ATA PIO mode
+func write_sector(lba: u32, buffer: *u8) {
+    hw::outb(ATA_PRIMARY_DRV, (0xE0 | ((lba >> 24) & 0x0F)) as u8);
+    hw::outb(ATA_PRIMARY_SEC, 1);
+    hw::outb(ATA_PRIMARY_LBA_LO, (lba & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+    hw::outb(ATA_PRIMARY_CMD, 0x30); # Write with retry
+
+    ata_wait_ready();
+
+    var i: u32 = 0;
+    while (i < 256) {
+        var offset1 = i * 2;
+        var lo: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(lo) : "r"(buffer), "r"(offset1) : "%eax");
+        
+        var offset2 = i * 2 + 1;
+        var hi: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(hi) : "r"(buffer), "r"(offset2) : "%eax");
+        
+        var word: u16 = (lo as u16) | ((hi as u16) << 8);
+        hw::outw(ATA_PRIMARY_DATA, word);
+        
+        i += 1;
+    }
+}

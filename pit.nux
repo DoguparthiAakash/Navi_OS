@@ -1,0 +1,219 @@
+@[no_std]
+import std::io;
+import std::hw;
+
+# ─── pit.nux — Programmable Interval Timer (PIT 8253/8254) ────────────────────
+#
+# The PIT is the key to preemptive scheduling. We program it to fire IRQ0
+# at a configurable frequency. Each IRQ0 triggers the scheduler to check
+# if it should switch tasks (round-robin preemption).
+#
+# PIT I/O Ports:
+#   0x40 - Channel 0 data port (IRQ0)
+#   0x41 - Channel 1 data port (DRAM refresh - legacy, unused)
+#   0x42 - Channel 2 data port (PC speaker)
+#   0x43 - Mode/Command register
+#
+# The PIT base frequency is 1,193,182 Hz.
+# Divisor = 1193182 / desired_hz
+# e.g., 100 Hz timer  → divisor = 11932
+#       1000 Hz timer → divisor = 1193
+
+var PIT_CH0:  u16 = 0x40;
+var PIT_CMD:  u16 = 0x43;
+
+# 100 Hz tick rate (10ms per tick)
+var PIT_DIVISOR: u16 = 11932;
+
+# Total ticks since boot
+var tick_count: u32 = 0;
+
+# ─── PIC (8259A) Ports ────────────────────────────────────────────────────────
+var PIT_PIC1_CMD:  u16 = 0x20;
+var PIT_PIC1_DATA: u16 = 0x21;
+var PIT_PIC2_CMD:  u16 = 0xA0;
+var PIT_PIC2_DATA: u16 = 0xA1;
+
+var PIT_EOI: u8 = 0x20;  # End-Of-Interrupt signal
+
+# ─── IDT (Interrupt Descriptor Table) ─────────────────────────────────────────
+# Each IDT entry is 8 bytes:
+#  Bytes 0-1:  offset bits 0-15
+#  Bytes 2-3:  segment selector (0x08 = kernel code segment in GDT)
+#  Byte  4:    reserved (zero)
+#  Byte  5:    type/attribute flags (0x8E = 32-bit interrupt gate, DPL=0, Present)
+#  Bytes 6-7:  offset bits 16-31
+#
+# We allocate IDT at a fixed physical address 0x01400000 (20 MB mark)
+# IDT pointer (IDTR) is at  0x01400800
+
+var IDT_BASE:  *u8 = 0x01400000;    # 256 entries * 8 bytes = 2048 bytes
+var IDTR_BASE: *u8 = 0x01400800;    # 6-byte IDT descriptor
+
+# ─── Initialize PIC ───────────────────────────────────────────────────────────
+func init_pic() {
+    # Start initialization sequence in cascade mode
+    hw::outb(PIT_PIC1_CMD,  0x11);  # ICW1: init + ICW4 needed
+    hw::outb(PIT_PIC2_CMD,  0x11);
+
+    # ICW2: Vector offsets. Map IRQ0-7 to INT 0x20-0x27, IRQ8-15 to INT 0x28-0x2F
+    hw::outb(PIT_PIC1_DATA, 0x20);
+    hw::outb(PIT_PIC2_DATA, 0x28);
+
+    # ICW3: Tell master PIC that slave is at IRQ2; tell slave its cascade identity
+    hw::outb(PIT_PIC1_DATA, 0x04);
+    hw::outb(PIT_PIC2_DATA, 0x02);
+
+    # ICW4: 8086 mode
+    hw::outb(PIT_PIC1_DATA, 0x01);
+    hw::outb(PIT_PIC2_DATA, 0x01);
+
+    # MASK ALL IRQs on both PICs — nothing fires until we explicitly unmask.
+    # This prevents triple fault from unhandled IRQ0 after sti.
+    hw::outb(PIT_PIC1_DATA, 0xFF);  # mask all master IRQs
+    hw::outb(PIT_PIC2_DATA, 0xFF);  # mask all slave IRQs
+}
+
+# ─── Initialize PIT ───────────────────────────────────────────────────────────
+func init_pit() {
+    # Command: Channel 0, lo/hi byte access, Mode 3 (square wave), binary
+    hw::outb(PIT_CMD, 0x36);
+
+    # Send divisor lo byte then hi byte
+    var lo: u8 = (PIT_DIVISOR & 0xFF) as u8;
+    var hi: u8 = ((PIT_DIVISOR >> 8) & 0xFF) as u8;
+    hw::outb(PIT_CH0, lo);
+    hw::outb(PIT_CH0, hi);
+}
+
+# ─── Write one IDT entry ───────────────────────────────────────────────────────
+func idt_set_gate(vector: u32, handler_addr: u32) {
+    var offset = vector * 8;
+
+    var lo_addr: u32 = handler_addr & 0xFFFF;
+    var hi_addr: u32 = (handler_addr >> 16) & 0xFFFF;
+    var selector: u32 = 0x08;   # kernel code segment
+    var flags: u32    = 0x8E;   # interrupt gate, present, DPL=0
+
+    # Byte 0-1: low 16 bits of handler address
+    var b0: u8 = (lo_addr & 0xFF) as u8;
+    var b1: u8 = ((lo_addr >> 8) & 0xFF) as u8;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(offset),     "q"(b0));
+    var off1: u32 = offset + 1;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off1), "q"(b1));
+
+    # Byte 2-3: segment selector
+    var b2: u8 = (selector & 0xFF) as u8;
+    var b3: u8 = 0;
+    var off2: u32 = offset + 2;
+    var off3: u32 = offset + 3;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off2), "q"(b2));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off3), "q"(b3));
+
+    # Byte 4: reserved = 0
+    var b4: u8 = 0;
+    var off4: u32 = offset + 4;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off4), "q"(b4));
+
+    # Byte 5: type/attr flags
+    var b5: u8 = flags as u8;
+    var off5: u32 = offset + 5;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off5), "q"(b5));
+
+    # Byte 6-7: high 16 bits of handler address
+    var b6: u8 = (hi_addr & 0xFF) as u8;
+    var b7: u8 = ((hi_addr >> 8) & 0xFF) as u8;
+    var off6: u32 = offset + 6;
+    var off7: u32 = offset + 7;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off6), "q"(b6));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off7), "q"(b7));
+}
+
+# ─── Load the IDT ─────────────────────────────────────────────────────────────
+func load_idt() {
+    # Write the 6-byte IDT descriptor: limit (2 bytes) + base address (4 bytes)
+    # Limit = (256 * 8) - 1 = 2047 = 0x07FF
+    var limit: u32 = 2047;
+    var base:  u32 = IDT_BASE as u32;
+
+    var lim_lo: u8 = (limit & 0xFF) as u8;
+    var lim_hi: u8 = ((limit >> 8) & 0xFF) as u8;
+    var off0: u32 = 0;
+    var off1: u32 = 1;
+    var off2: u32 = 2;
+    var off3: u32 = 3;
+    var off4: u32 = 4;
+    var off5: u32 = 5;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off0), "q"(lim_lo));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off1), "q"(lim_hi));
+
+    var b0: u8 = (base & 0xFF) as u8;
+    var b1: u8 = ((base >> 8) & 0xFF) as u8;
+    var b2: u8 = ((base >> 16) & 0xFF) as u8;
+    var b3: u8 = ((base >> 24) & 0xFF) as u8;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off2), "q"(b0));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off3), "q"(b1));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off4), "q"(b2));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off5), "q"(b3));
+
+    # Execute LIDT instruction
+    asm("lidt (%0)\n\t" : : "r"(IDTR_BASE));
+}
+
+# ─── IRQ0 Timer Handler ────────────────────────────────────────────────────────
+# Called on every PIT tick. Increments tick_count and sends EOI.
+# In a full preemptive kernel this also saves/restores register context.
+func irq0_timer_tick() {
+    tick_count += 1;
+    # Send End-Of-Interrupt to PIC1
+    hw::outb(PIT_PIC1_CMD, PIT_EOI);
+}
+
+# ─── Get current tick count ────────────────────────────────────────────────────
+func get_ticks() -> u32 {
+    return tick_count;
+}
+
+# ─── Sleep for N milliseconds (simple busy-wait loop) ────────────────────────
+# Uses a calibrated spin loop. Does NOT rely on interrupts or HLT.
+# Rough calibration: ~10 million iterations ≈ 1 second on slow emulated CPU.
+func sleep_ms(ms: u32) {
+    var iters: u32 = ms * 10000;
+    var i: u32 = 0;
+    while (i < iters) { i += 1; }
+}
+
+# ─── Initialize PIC + PIT safely (no sti, no IDT load yet) ───────────────────
+# This reprograms the PIC vector offsets and configures PIT frequency.
+# We do NOT call sti here because our IDT handlers are not yet wired.
+# The kernel runs in cli (interrupts disabled) mode for safety.
+func init_interrupts() {
+    # Zero out the IDT region
+    var i: u32 = 0;
+    while (i < 2048) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(i));
+        i += 1;
+    }
+
+    # Reprogram PIC and set PIT frequency (all IRQs masked inside init_pic)
+    init_pic();
+    init_pit();
+
+    # Load IDT descriptor so LIDT points somewhere valid.
+    # All 256 entries are zero = "not present", so even if sti were called
+    # and an interrupt fired, the CPU would see a not-present gate and
+    # generate a GP fault instead of jumping to address 0.
+    load_idt();
+
+    # DO NOT call sti here. Interrupts remain disabled (cli from boot).
+    # Call pit::enable_timer() only once real IRQ handlers are registered.
+    io::print("[pit] PIC remapped, PIT configured at 100 Hz. Interrupts masked.\n");
+}
+
+# ─── Enable timer interrupt (call only when IRQ0 handler is registered) ───────
+func enable_timer() {
+    # Unmask only IRQ0 (bit 0 = 0) on master PIC, keep everything else masked
+    hw::outb(PIT_PIC1_DATA, 0xFE);  # 11111110 = IRQ0 unmasked
+    # Enable CPU interrupts
+    asm("sti\n\t");
+}

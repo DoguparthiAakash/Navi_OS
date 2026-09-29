@@ -1823,6 +1823,1611 @@ void populate_readme() {
 
 
 
+// ─── process.nux — Process, Job, and Thread Management ────────────────────────
+//
+// A basic process table for cooperative multitasking/job tracking.
+// Layout in low memory (above ramfs):
+//   0x01300000 - proc_names (16 bytes * 32 = 512 bytes)
+//   0x01300200 - proc_pids (4 bytes * 32 = 128 bytes)
+//   0x01300300 - proc_states (1 byte * 32 = 32 bytes) (0=free, 1=running, 2=sleeping, 3=stopped)
+//   0x01300400 - proc_threads (4 bytes * 32 = 128 bytes) (thread count)
+
+uint32_t MAX_PROCESSES = 32;
+uint8_t* PROC_NAMES = 0x01300000;
+uint32_t* PROC_PIDS = 0x01300200;
+uint8_t* PROC_STATES = 0x01300300;
+uint32_t* PROC_THREADS = 0x01300400;
+
+uint8_t STATE_FREE = 0;
+uint8_t STATE_RUNNING = 1;
+uint8_t STATE_SLEEPING = 2;
+uint8_t STATE_STOPPED = 3;
+
+uint32_t next_pid = 1;
+uint32_t current_task_index = 0;
+
+void _process_copy_name(uint8_t* dst, uint8_t* src) {
+    uint32_t i = 0;
+    while (i < 16) {
+        uint8_t c = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(src), "r"(i) : "%eax");
+        __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(i), "q"(c));
+        if (c == 0) { break; }
+        i += 1;
+    }
+}
+
+uint32_t create_process(uint8_t* name) {
+    uint32_t i = 0;
+    while (i < MAX_PROCESSES) {
+        uint8_t state = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state == STATE_FREE) {
+            // Copy name
+            uint32_t name_offset = i * 16;
+            uint8_t* name_dst = 0;
+            __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(name_dst) : "r"(PROC_NAMES), "r"(name_offset));
+            _process_copy_name(name_dst, name);
+            
+            // Set PID
+            uint32_t pid = next_pid;
+            next_pid += 1;
+            uint32_t pid_offset = i * 4;
+            __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t" : : "r"(PROC_PIDS), "r"(pid_offset), "r"(pid) : "%eax");
+            
+            // Set state to running
+            uint32_t running = STATE_RUNNING;
+            __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(i), "q"(running));
+            
+            // 1 main thread
+            uint32_t one_thread = 1;
+            __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t" : : "r"(PROC_THREADS), "r"(pid_offset), "r"(one_thread) : "%eax");
+            
+            return pid;
+        }
+        i += 1;
+    }
+    return 0; // Out of process slots
+}
+
+void init_processes() {
+    uint32_t i = 0;
+    while (i < MAX_PROCESSES) {
+        __asm__("movb $0, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(i));
+        i += 1;
+    }
+    
+    // Create the shell process as PID 1
+    create_process("shell");
+}
+
+uint32_t get_pid_index(uint32_t pid) {
+    uint32_t i = 0;
+    while (i < MAX_PROCESSES) {
+        uint8_t state = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state != STATE_FREE) {
+            uint32_t curr_pid = 0;
+            uint32_t pid_offset = i * 4;
+            __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(curr_pid) : "r"(PROC_PIDS), "r"(pid_offset) : "%eax");
+            if (curr_pid == pid) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return MAX_PROCESSES;
+}
+
+uint8_t kill_process(uint32_t pid) {
+    if (pid == 1) { return 0; } // Don't kill init/shell
+    uint32_t idx = get_pid_index(pid);
+    if (idx == MAX_PROCESSES) { return 0; }
+    
+    // Set state to FREE
+    uint32_t free_state = STATE_FREE;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(idx), "q"(free_state));
+    return 1;
+}
+
+void print_ps() {
+    print("PID  STATE    THREADS  COMMAND\n");
+    uint32_t i = 0;
+    while (i < MAX_PROCESSES) {
+        uint8_t state = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state != STATE_FREE) {
+            uint32_t curr_pid = 0;
+            uint32_t pid_offset = i * 4;
+            __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(curr_pid) : "r"(PROC_PIDS), "r"(pid_offset) : "%eax");
+            
+            uint32_t threads = 0;
+            __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(threads) : "r"(PROC_THREADS), "r"(pid_offset) : "%eax");
+            
+            uint32_t name_offset = i * 16;
+            uint8_t* name_ptr = 0;
+            __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(name_ptr) : "r"(PROC_NAMES), "r"(name_offset));
+            
+            print_u32(curr_pid);
+            if (curr_pid < 10) { print("    "); } else { print("   "); }
+            
+            if (state == STATE_RUNNING) { print("RUNNING  "); }
+            else if (state == STATE_SLEEPING) { print("SLEEPING "); }
+            else if (state == STATE_STOPPED) { print("STOPPED  "); }
+            
+            print_u32(threads);
+            print("        ");
+            print(name_ptr);
+            print_char(10);
+        }
+        i += 1;
+    }
+}
+
+// ─── Scheduler ────────────────────────────────────────────────────────────────
+// A basic cooperative round-robin scheduler stub.
+void schedule() {
+    uint32_t start_index = current_task_index;
+    uint32_t i = start_index + 1;
+    if (i >= MAX_PROCESSES) { i = 0; }
+    
+    while (i != start_index) {
+        uint8_t state = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        
+        if (state == STATE_RUNNING) {
+            // Switch to this task
+            current_task_index = i;
+            
+            // In a real preemptive kernel, we would swap context here (registers/stack).
+            // For now, it's just updating tracking variables.
+            return;
+        }
+        
+        i += 1;
+        if (i >= MAX_PROCESSES) { i = 0; }
+    }
+    // If no other task is running, continue current task
+}
+
+
+
+
+// ─── memory.nux — Memory Management ──────────────────────────────────────────
+//
+// A basic physical memory manager and heap allocator for Navi OS.
+// For simplicity in this early stage, we use a bump allocator for the heap,
+// starting at 0x02000000 (32MB mark).
+
+uint8_t* HEAP_BASE = 0x02000000;
+uint8_t* current_heap = 0x02000000;
+
+// Memory Management initialization
+void init_memory() {
+    current_heap = HEAP_BASE;
+}
+
+// Simple malloc (bump allocator)
+uint8_t* mem_alloc(uint32_t size) {
+    uint32_t ptr = current_heap;
+    
+    // Calculate new heap pointer
+    uint32_t new_heap = 0;
+    __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(new_heap) : "r"(current_heap), "r"(size));
+    
+    // Align to 4 bytes
+    uint32_t remainder = new_heap % 4;
+    if (remainder != 0) {
+        new_heap = new_heap + (4 - remainder);
+    }
+    
+    current_heap = new_heap;
+    return ptr;
+}
+
+// Free (no-op in a bump allocator)
+void mem_free(uint8_t* ptr) {
+    // In a full memory manager, we would add the block to a free list.
+    // Currently a no-op since it's a bump allocator.
+}
+
+// Get total allocated memory
+uint32_t get_allocated_memory() {
+    uint32_t diff = 0;
+    __asm__("movl %1, %0\n\t" "subl %2, %0\n\t" : "=r"(diff) : "r"(current_heap), "r"(HEAP_BASE));
+    return diff;
+}
+
+
+
+
+// ─── disk.nux — Disk Management (ATA PIO) ────────────────────────────────────
+//
+// Very basic ATA PIO driver to read/write sectors from the primary IDE bus.
+// Real disk management would use interrupts, DMA, and a file system driver.
+
+uint16_t ATA_PRIMARY_DATA = 0x1F0;
+uint16_t ATA_PRIMARY_ERR = 0x1F1;
+uint16_t ATA_PRIMARY_SEC = 0x1F2;
+uint16_t ATA_PRIMARY_LBA_LO = 0x1F3;
+uint16_t ATA_PRIMARY_LBA_MID = 0x1F4;
+uint16_t ATA_PRIMARY_LBA_HI = 0x1F5;
+uint16_t ATA_PRIMARY_DRV = 0x1F6;
+uint16_t ATA_PRIMARY_CMD = 0x1F7;
+uint16_t ATA_PRIMARY_STAT = 0x1F7;
+
+// Wait until the drive is ready
+void ata_wait_ready() {
+    while (true) {
+        uint32_t status = inb(ATA_PRIMARY_STAT);
+        // Wait until BSY (bit 7) is clear and RDY (bit 6) is set
+        if ((status & 0x80) == 0 && (status & 0x40) != 0) {
+            break;
+        }
+    }
+}
+
+// Read a 512-byte sector using ATA PIO mode
+void read_sector(uint32_t lba, uint8_t* buffer) {
+    outb(ATA_PRIMARY_DRV, (0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_PRIMARY_SEC, 1);
+    outb(ATA_PRIMARY_LBA_LO, (lba & 0xFF));
+    outb(ATA_PRIMARY_LBA_MID, ((lba >> 8) & 0xFF));
+    outb(ATA_PRIMARY_LBA_HI, ((lba >> 16) & 0xFF));
+    outb(ATA_PRIMARY_CMD, 0x20); // Read with retry
+
+    ata_wait_ready();
+
+    uint32_t i = 0;
+    while (i < 256) {
+        uint32_t word = inw(ATA_PRIMARY_DATA);
+        
+        // Store low byte
+        uint8_t lo = (word & 0xFF);
+        uint32_t offset1 = i * 2;
+        __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(buffer), "r"(offset1), "q"(lo));
+        
+        // Store high byte
+        uint8_t hi = ((word >> 8) & 0xFF);
+        uint32_t offset2 = i * 2 + 1;
+        __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(buffer), "r"(offset2), "q"(hi));
+        
+        i += 1;
+    }
+}
+
+// Write a 512-byte sector using ATA PIO mode
+void write_sector(uint32_t lba, uint8_t* buffer) {
+    outb(ATA_PRIMARY_DRV, (0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_PRIMARY_SEC, 1);
+    outb(ATA_PRIMARY_LBA_LO, (lba & 0xFF));
+    outb(ATA_PRIMARY_LBA_MID, ((lba >> 8) & 0xFF));
+    outb(ATA_PRIMARY_LBA_HI, ((lba >> 16) & 0xFF));
+    outb(ATA_PRIMARY_CMD, 0x30); // Write with retry
+
+    ata_wait_ready();
+
+    uint32_t i = 0;
+    while (i < 256) {
+        uint32_t offset1 = i * 2;
+        uint8_t lo = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(lo) : "r"(buffer), "r"(offset1) : "%eax");
+        
+        uint32_t offset2 = i * 2 + 1;
+        uint8_t hi = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(hi) : "r"(buffer), "r"(offset2) : "%eax");
+        
+        uint16_t word = (lo) | ((hi) << 8);
+        outw(ATA_PRIMARY_DATA, word);
+        
+        i += 1;
+    }
+}
+
+
+
+
+
+// ─── pit.nux — Programmable Interval Timer (PIT 8253/8254) ────────────────────
+//
+// The PIT is the key to preemptive scheduling. We program it to fire IRQ0
+// at a configurable frequency. Each IRQ0 triggers the scheduler to check
+// if it should switch tasks (round-robin preemption).
+//
+// PIT I/O Ports:
+//   0x40 - Channel 0 data port (IRQ0)
+//   0x41 - Channel 1 data port (DRAM refresh - legacy, unused)
+//   0x42 - Channel 2 data port (PC speaker)
+//   0x43 - Mode/Command register
+//
+// The PIT base frequency is 1,193,182 Hz.
+// Divisor = 1193182 / desired_hz
+// e.g., 100 Hz timer  → divisor = 11932
+//       1000 Hz timer → divisor = 1193
+
+uint16_t PIT_CH0 = 0x40;
+uint16_t PIT_CMD = 0x43;
+
+// 100 Hz tick rate (10ms per tick)
+uint16_t PIT_DIVISOR = 11932;
+
+// Total ticks since boot
+uint32_t tick_count = 0;
+
+// ─── PIC (8259A) Ports ────────────────────────────────────────────────────────
+uint16_t PIT_PIC1_CMD = 0x20;
+uint16_t PIT_PIC1_DATA = 0x21;
+uint16_t PIT_PIC2_CMD = 0xA0;
+uint16_t PIT_PIC2_DATA = 0xA1;
+
+uint8_t PIT_EOI = 0x20;  // End-Of-Interrupt signal
+
+// ─── IDT (Interrupt Descriptor Table) ─────────────────────────────────────────
+// Each IDT entry is 8 bytes:
+//  Bytes 0-1:  offset bits 0-15
+//  Bytes 2-3:  segment selector (0x08 = kernel code segment in GDT)
+//  Byte  4:    reserved (zero)
+//  Byte  5:    type/attribute flags (0x8E = 32-bit interrupt gate, DPL=0, Present)
+//  Bytes 6-7:  offset bits 16-31
+//
+// We allocate IDT at a fixed physical address 0x01400000 (20 MB mark)
+// IDT pointer (IDTR) is at  0x01400800
+
+uint8_t* IDT_BASE = 0x01400000;    // 256 entries * 8 bytes = 2048 bytes
+uint8_t* IDTR_BASE = 0x01400800;    // 6-byte IDT descriptor
+
+// ─── Initialize PIC ───────────────────────────────────────────────────────────
+void init_pic() {
+    // Start initialization sequence in cascade mode
+    outb(PIT_PIC1_CMD,  0x11);  // ICW1: init + ICW4 needed
+    outb(PIT_PIC2_CMD,  0x11);
+
+    // ICW2: Vector offsets. Map IRQ0-7 to INT 0x20-0x27, IRQ8-15 to INT 0x28-0x2F
+    outb(PIT_PIC1_DATA, 0x20);
+    outb(PIT_PIC2_DATA, 0x28);
+
+    // ICW3: Tell master PIC that slave is at IRQ2; tell slave its cascade identity
+    outb(PIT_PIC1_DATA, 0x04);
+    outb(PIT_PIC2_DATA, 0x02);
+
+    // ICW4: 8086 mode
+    outb(PIT_PIC1_DATA, 0x01);
+    outb(PIT_PIC2_DATA, 0x01);
+
+    // MASK ALL IRQs on both PICs — nothing fires until we explicitly unmask.
+    // This prevents triple fault from unhandled IRQ0 after sti.
+    outb(PIT_PIC1_DATA, 0xFF);  // mask all master IRQs
+    outb(PIT_PIC2_DATA, 0xFF);  // mask all slave IRQs
+}
+
+// ─── Initialize PIT ───────────────────────────────────────────────────────────
+void init_pit() {
+    // Command: Channel 0, lo/hi byte access, Mode 3 (square wave), binary
+    outb(PIT_CMD, 0x36);
+
+    // Send divisor lo byte then hi byte
+    uint8_t lo = (PIT_DIVISOR & 0xFF);
+    uint8_t hi = ((PIT_DIVISOR >> 8) & 0xFF);
+    outb(PIT_CH0, lo);
+    outb(PIT_CH0, hi);
+}
+
+// ─── Write one IDT entry ───────────────────────────────────────────────────────
+void idt_set_gate(uint32_t vector, uint32_t handler_addr) {
+    uint32_t offset = vector * 8;
+
+    uint32_t lo_addr = handler_addr & 0xFFFF;
+    uint32_t hi_addr = (handler_addr >> 16) & 0xFFFF;
+    uint32_t selector = 0x08;   // kernel code segment
+    uint32_t flags = 0x8E;   // interrupt gate, present, DPL=0
+
+    // Byte 0-1: low 16 bits of handler address
+    uint8_t b0 = (lo_addr & 0xFF);
+    uint8_t b1 = ((lo_addr >> 8) & 0xFF);
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(offset),     "q"(b0));
+    uint32_t off1 = offset + 1;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off1), "q"(b1));
+
+    // Byte 2-3: segment selector
+    uint8_t b2 = (selector & 0xFF);
+    uint8_t b3 = 0;
+    uint32_t off2 = offset + 2;
+    uint32_t off3 = offset + 3;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off2), "q"(b2));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off3), "q"(b3));
+
+    // Byte 4: reserved = 0
+    uint8_t b4 = 0;
+    uint32_t off4 = offset + 4;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off4), "q"(b4));
+
+    // Byte 5: type/attr flags
+    uint8_t b5 = flags;
+    uint32_t off5 = offset + 5;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off5), "q"(b5));
+
+    // Byte 6-7: high 16 bits of handler address
+    uint8_t b6 = (hi_addr & 0xFF);
+    uint8_t b7 = ((hi_addr >> 8) & 0xFF);
+    uint32_t off6 = offset + 6;
+    uint32_t off7 = offset + 7;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off6), "q"(b6));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(off7), "q"(b7));
+}
+
+// ─── Load the IDT ─────────────────────────────────────────────────────────────
+void load_idt() {
+    // Write the 6-byte IDT descriptor: limit (2 bytes) + base address (4 bytes)
+    // Limit = (256 * 8) - 1 = 2047 = 0x07FF
+    uint32_t limit = 2047;
+    uint32_t base = IDT_BASE;
+
+    uint8_t lim_lo = (limit & 0xFF);
+    uint8_t lim_hi = ((limit >> 8) & 0xFF);
+    uint32_t off0 = 0;
+    uint32_t off1 = 1;
+    uint32_t off2 = 2;
+    uint32_t off3 = 3;
+    uint32_t off4 = 4;
+    uint32_t off5 = 5;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off0), "q"(lim_lo));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off1), "q"(lim_hi));
+
+    uint8_t b0 = (base & 0xFF);
+    uint8_t b1 = ((base >> 8) & 0xFF);
+    uint8_t b2 = ((base >> 16) & 0xFF);
+    uint8_t b3 = ((base >> 24) & 0xFF);
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off2), "q"(b0));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off3), "q"(b1));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off4), "q"(b2));
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(IDTR_BASE), "r"(off5), "q"(b3));
+
+    // Execute LIDT instruction
+    __asm__("lidt (%0)\n\t" : : "r"(IDTR_BASE));
+}
+
+// ─── IRQ0 Timer Handler ────────────────────────────────────────────────────────
+// Called on every PIT tick. Increments tick_count and sends EOI.
+// In a full preemptive kernel this also saves/restores register context.
+void irq0_timer_tick() {
+    tick_count += 1;
+    // Send End-Of-Interrupt to PIC1
+    outb(PIT_PIC1_CMD, PIT_EOI);
+}
+
+// ─── Get current tick count ────────────────────────────────────────────────────
+uint32_t get_ticks() {
+    return tick_count;
+}
+
+// ─── Sleep for N milliseconds (simple busy-wait loop) ────────────────────────
+// Uses a calibrated spin loop. Does NOT rely on interrupts or HLT.
+// Rough calibration: ~10 million iterations ≈ 1 second on slow emulated CPU.
+void sleep_ms(uint32_t ms) {
+    uint32_t iters = ms * 10000;
+    uint32_t i = 0;
+    while (i < iters) { i += 1; }
+}
+
+// ─── Initialize PIC + PIT safely (no sti, no IDT load yet) ───────────────────
+// This reprograms the PIC vector offsets and configures PIT frequency.
+// We do NOT call sti here because our IDT handlers are not yet wired.
+// The kernel runs in cli (interrupts disabled) mode for safety.
+void init_interrupts() {
+    // Zero out the IDT region
+    uint32_t i = 0;
+    while (i < 2048) {
+        __asm__("movb $0, (%0,%1,1)\n\t" : : "r"(IDT_BASE), "r"(i));
+        i += 1;
+    }
+
+    // Reprogram PIC and set PIT frequency (all IRQs masked inside init_pic)
+    init_pic();
+    init_pit();
+
+    // Load IDT descriptor so LIDT points somewhere valid.
+    // All 256 entries are zero = "not present", so even if sti were called
+    // and an interrupt fired, the CPU would see a not-present gate and
+    // generate a GP fault instead of jumping to address 0.
+    load_idt();
+
+    // DO NOT call sti here. Interrupts remain disabled (cli from boot).
+    // Call enable_timer() only once real IRQ handlers are registered.
+    print("[pit] PIC remapped, PIT configured at 100 Hz. Interrupts masked.\n");
+}
+
+// ─── Enable timer interrupt (call only when IRQ0 handler is registered) ───────
+void enable_timer() {
+    // Unmask only IRQ0 (bit 0 = 0) on master PIC, keep everything else masked
+    outb(PIT_PIC1_DATA, 0xFE);  // 11111110 = IRQ0 unmasked
+    // Enable CPU interrupts
+    __asm__("sti\n\t");
+}
+
+
+
+
+// ─── thread.nux — Thread Management ──────────────────────────────────────────
+//
+// Each thread has its own saved CPU context (registers) so the scheduler
+// can pause one thread and resume another (preemptive multitasking).
+//
+// Thread context layout (saved at THREAD_STACK_BASE + tid * THREAD_CONTEXT_SIZE):
+//   +0:  eax   +4:  ebx   +8:  ecx   +12: edx
+//   +16: esi   +20: edi   +24: ebp   +28: esp (stack pointer)
+//   +32: eip   (instruction pointer = where to resume)
+//   +36: eflags
+//   +40: state (0=free, 1=ready, 2=running, 3=blocked)
+//   +44: owner_pid
+//   +48: stack_top (the top of this thread's private stack)
+//
+// Thread stacks are at 0x01600000, each 16 KB apart:
+//   Thread 0: 0x01600000 - 0x01603FFF
+//   Thread 1: 0x01604000 - 0x01607FFF
+//   ...
+
+uint32_t MAX_THREADS = 64;
+uint8_t* THREAD_CTX_BASE = 0x01500000;   // 64 * 52 = 3328 bytes for contexts
+uint32_t THREAD_STACK_BASE = 0x01600000;   // Thread stacks start here
+uint32_t THREAD_STACK_SIZE = 0x4000;       // 16 KB per thread
+uint32_t THREAD_CTX_SIZE = 52;           // bytes per context
+
+// Context field offsets
+uint32_t CTX_EAX = 0;
+uint32_t CTX_EBX = 4;
+uint32_t CTX_ECX = 8;
+uint32_t CTX_EDX = 12;
+uint32_t CTX_ESI = 16;
+uint32_t CTX_EDI = 20;
+uint32_t CTX_EBP = 24;
+uint32_t CTX_ESP = 28;
+uint32_t CTX_EIP = 32;
+uint32_t CTX_EFLAGS = 36;
+uint32_t CTX_STATE = 40;
+uint32_t CTX_OWNER = 44;
+uint32_t CTX_STKTOP = 48;
+
+// Thread states
+uint8_t TSTATE_FREE = 0;
+uint8_t TSTATE_READY = 1;
+uint8_t TSTATE_RUNNING = 2;
+uint8_t TSTATE_BLOCKED = 3;
+
+// Currently running thread index
+uint32_t current_thread = 0;
+uint32_t next_tid = 1;
+
+// ─── Helpers to read/write context fields ─────────────────────────────────────
+void _thread_write_u32(uint32_t tid, uint32_t field_offset, uint32_t value) {
+    uint32_t ctx_offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(THREAD_CTX_BASE), "r"(ctx_offset), "r"(value) : "%eax");
+}
+
+uint32_t _thread_read_u32(uint32_t tid, uint32_t field_offset) {
+    uint32_t ctx_offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    uint32_t val = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(val) : "r"(THREAD_CTX_BASE), "r"(ctx_offset) : "%eax");
+    return val;
+}
+
+void _thread_write_u8(uint32_t tid, uint32_t field_offset, uint8_t value) {
+    uint32_t ctx_offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movb %b2, (%%eax)\n\t"
+        : : "r"(THREAD_CTX_BASE), "r"(ctx_offset), "q"(value) : "%eax");
+}
+
+uint8_t _thread_read_u8(uint32_t tid, uint32_t field_offset) {
+    uint32_t ctx_offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    uint8_t val = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movzbl (%%eax), %%ecx\n\t" "movb %%cl, %b0\n\t"
+        : "=q"(val) : "r"(THREAD_CTX_BASE), "r"(ctx_offset) : "%eax", "%ecx");
+    return val;
+}
+
+// ─── Initialize the thread table ──────────────────────────────────────────────
+void init_threads() {
+    uint32_t i = 0;
+    while (i < MAX_THREADS) {
+        _thread_write_u8(i, CTX_STATE, TSTATE_FREE);
+        _thread_write_u32(i, CTX_OWNER, 0);
+        i += 1;
+    }
+    // Mark thread 0 as the kernel/shell thread (already running)
+    _thread_write_u8(0, CTX_STATE, TSTATE_RUNNING);
+    _thread_write_u32(0, CTX_OWNER, 1);  // PID 1 (shell)
+}
+
+// ─── Create a new thread for a process ────────────────────────────────────────
+// entry_point: the function address to start executing
+// owner_pid:   the process that owns this thread
+// Returns the tid, or MAX_THREADS on failure.
+uint32_t create_thread(uint32_t entry_point, uint32_t owner_pid) {
+    uint32_t i = 1;  // Skip tid 0 (kernel thread)
+    while (i < MAX_THREADS) {
+        uint32_t state = _thread_read_u8(i, CTX_STATE);
+        if (state == TSTATE_FREE) {
+            // Set up the thread's private stack
+            uint32_t stack_top = 0;
+            __asm__("movl %1, %0\n\t" "movl %2, %%eax\n\t" "imull %3, %%eax\n\t" "addl %%eax, %0\n\t"
+                : "=r"(stack_top) : "r"(THREAD_STACK_BASE), "r"(i), "r"(THREAD_STACK_SIZE) : "%eax");
+
+            _thread_write_u32(i, CTX_EIP,    entry_point);
+            _thread_write_u32(i, CTX_ESP,    stack_top);
+            _thread_write_u32(i, CTX_EBP,    stack_top);
+            _thread_write_u32(i, CTX_EFLAGS, 0x200);       // IF=1 (interrupts enabled)
+            _thread_write_u32(i, CTX_OWNER,  owner_pid);
+            _thread_write_u32(i, CTX_STKTOP, stack_top);
+            _thread_write_u8(i,  CTX_STATE,  TSTATE_READY);
+
+            return i;
+        }
+        i += 1;
+    }
+    return MAX_THREADS; // No free slot
+}
+
+// ─── Kill a thread ────────────────────────────────────────────────────────────
+uint8_t kill_thread(uint32_t tid) {
+    if (tid == 0) { return 0; } // Never kill kernel thread
+    uint32_t state = _thread_read_u8(tid, CTX_STATE);
+    if (state == TSTATE_FREE) { return 0; }
+    _thread_write_u8(tid, CTX_STATE, TSTATE_FREE);
+    return 1;
+}
+
+// ─── Block/Unblock a thread ───────────────────────────────────────────────────
+void block_thread(uint32_t tid) {
+    _thread_write_u8(tid, CTX_STATE, TSTATE_BLOCKED);
+}
+
+void unblock_thread(uint32_t tid) {
+    uint32_t state = _thread_read_u8(tid, CTX_STATE);
+    if (state == TSTATE_BLOCKED) {
+        _thread_write_u8(tid, CTX_STATE, TSTATE_READY);
+    }
+}
+
+// ─── Print thread list ────────────────────────────────────────────────────────
+void print_threads() {
+    print("TID  PID  STATE    STACK_TOP\n");
+    uint32_t i = 0;
+    while (i < MAX_THREADS) {
+        uint32_t state = _thread_read_u8(i, CTX_STATE);
+        if (state != TSTATE_FREE) {
+            uint32_t owner = _thread_read_u32(i, CTX_OWNER);
+            uint32_t stktop = _thread_read_u32(i, CTX_STKTOP);
+            print_u32(i);
+            print("    ");
+            print_u32(owner);
+            print("    ");
+            if (state == TSTATE_READY)   { print("READY   "); }
+            if (state == TSTATE_RUNNING) { print("RUNNING "); }
+            if (state == TSTATE_BLOCKED) { print("BLOCKED "); }
+            print("0x");
+            print_u32(stktop);
+            print_char(10);
+        }
+        i += 1;
+    }
+}
+
+// ─── Preemptive Round-Robin Scheduler ─────────────────────────────────────────
+// Called from the PIT IRQ0 handler tick.
+// Saves current context, finds next READY thread, restores its context.
+// NOTE: Full context save/restore requires inline asm at the interrupt handler.
+//       This is the high-level scheduler logic that selects the next thread.
+uint32_t schedule_next() {
+    uint32_t start = current_thread;
+    uint32_t i = current_thread + 1;
+    if (i >= MAX_THREADS) { i = 0; }
+
+    while (i != start) {
+        uint32_t state = _thread_read_u8(i, CTX_STATE);
+        if (state == TSTATE_READY || state == TSTATE_RUNNING) {
+            // Mark old thread as READY (if it was RUNNING)
+            uint32_t old_state = _thread_read_u8(current_thread, CTX_STATE);
+            if (old_state == TSTATE_RUNNING) {
+                _thread_write_u8(current_thread, CTX_STATE, TSTATE_READY);
+            }
+            // Switch to new thread
+            _thread_write_u8(i, CTX_STATE, TSTATE_RUNNING);
+            current_thread = i;
+            return i;
+        }
+        i += 1;
+        if (i >= MAX_THREADS) { i = 0; }
+    }
+    // No other thread found — stay on current
+    return current_thread;
+}
+
+
+
+
+
+// ─── vfs.nux — Virtual File System (VFS) Layer ────────────────────────────────
+//
+// The VFS is an abstraction layer that allows different filesystems (ramfs,
+// ext2, fat32, etc.) to be mounted at different points in a unified directory
+// tree. All user-facing file operations go through the VFS.
+//
+// Architecture:
+//   vfs_mount[]        — mount table (which fs is at which path)
+//   vfs_node[]         — inode table (represents files/dirs across all fs)
+//
+// VFS Node layout (stored at VFS_NODES_BASE, 64 bytes per node):
+//   +0:  name[32]      — filename (null-terminated, max 31 chars)
+//   +32: type          — 0=file, 1=directory, 2=symlink
+//   +36: size          — file size in bytes
+//   +40: fs_id         — which filesystem owns this node (0=ramfs, 1=ext2...)
+//   +44: fs_inode      — inode number in the owning filesystem
+//   +48: parent_idx    — index of parent directory node
+//   +52: flags         — permission/attribute flags
+//   +56: reserved[8]   — (padding to 64 bytes)
+//
+// Mount table (stored at VFS_MOUNTS_BASE, 48 bytes per entry):
+//   +0:  path[32]      — mount point path (e.g. "/", "/tmp", "/dev")
+//   +32: fs_id         — filesystem type ID
+//   +36: flags         — mount flags (read-only, etc.)
+//   +40: reserved[8]
+
+uint32_t VFS_MAX_NODES = 256;
+uint32_t VFS_MAX_MOUNTS = 8;
+uint32_t VFS_NODE_SIZE = 64;
+uint32_t VFS_MOUNT_SIZE = 48;
+
+// Memory layout (above pit/thread allocations)
+uint8_t* VFS_NODES_BASE = 0x01800000;   // 256 * 64 = 16384 bytes
+uint8_t* VFS_MOUNTS_BASE = 0x01804100;   // 8 * 48   = 384 bytes
+
+// Node field offsets
+uint32_t VN_NAME = 0;
+uint32_t VN_TYPE = 32;
+uint32_t VN_SIZE = 36;
+uint32_t VN_FSID = 40;
+uint32_t VN_INODE = 44;
+uint32_t VN_PARENT = 48;
+uint32_t VN_FLAGS = 52;
+
+// Node types
+uint32_t VN_FILE = 0;
+uint32_t VN_DIR = 1;
+uint32_t VN_LINK = 2;
+
+// Filesystem IDs
+uint32_t FSID_NONE = 0xFFFFFFFF;
+uint32_t FSID_RAMFS = 0;
+uint32_t FSID_EXT2 = 1;
+
+uint32_t vfs_node_count = 0;
+uint32_t vfs_mount_count = 0;
+
+// ─── Low-level node field accessors ───────────────────────────────────────────
+void _vn_write_u32(uint32_t node_idx, uint32_t field, uint32_t val) {
+    uint32_t offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE), "r"(field));
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(VFS_NODES_BASE), "r"(offset), "r"(val) : "%eax");
+}
+
+uint32_t _vn_read_u32(uint32_t node_idx, uint32_t field) {
+    uint32_t offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE), "r"(field));
+    uint32_t val = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(val) : "r"(VFS_NODES_BASE), "r"(offset) : "%eax");
+    return val;
+}
+
+uint8_t* _vn_name_ptr(uint32_t node_idx) {
+    uint32_t offset = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t"
+        : "=r"(offset) : "r"(node_idx), "r"(VFS_NODE_SIZE));
+    uint8_t* ptr = 0;
+    __asm__("movl %1, %0\n\t" "addl %2, %0\n\t"
+        : "=r"(ptr) : "r"(VFS_NODES_BASE), "r"(offset));
+    return ptr;
+}
+
+void _vn_copy_name(uint32_t node_idx, uint8_t* name) {
+    uint32_t dst = _vn_name_ptr(node_idx);
+    uint32_t i = 0;
+    while (i < 31) {
+        uint8_t c = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(name), "r"(i) : "%eax");
+        __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(i), "q"(c));
+        if (c == 0) { break; }
+        i += 1;
+    }
+    // Always null-terminate at byte 31
+    uint8_t null_byte = 0;
+    uint32_t max_idx = 31;
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(max_idx), "q"(null_byte));
+}
+
+// ─── Initialize VFS ───────────────────────────────────────────────────────────
+void init_vfs() {
+    // Zero out node and mount tables
+    uint32_t i = 0;
+    while (i < VFS_MAX_NODES * VFS_NODE_SIZE) {
+        __asm__("movb $0, (%0,%1,1)\n\t" : : "r"(VFS_NODES_BASE), "r"(i));
+        i += 1;
+    }
+    i = 0;
+    while (i < VFS_MAX_MOUNTS * VFS_MOUNT_SIZE) {
+        __asm__("movb $0, (%0,%1,1)\n\t" : : "r"(VFS_MOUNTS_BASE), "r"(i));
+        i += 1;
+    }
+
+    // Create root directory node "/"
+    _vn_copy_name(0, "/");
+    _vn_write_u32(0, VN_TYPE,   VN_DIR);
+    _vn_write_u32(0, VN_SIZE,   0);
+    _vn_write_u32(0, VN_FSID,   FSID_RAMFS);
+    _vn_write_u32(0, VN_INODE,  0);
+    _vn_write_u32(0, VN_PARENT, 0);  // root's parent is itself
+    _vn_write_u32(0, VN_FLAGS,  0x755);
+
+    vfs_node_count = 1;
+
+    print("[vfs] Initialized. Root node mounted at /\n");
+}
+
+// ─── Create a file node in the VFS ────────────────────────────────────────────
+uint32_t vfs_create_file(uint8_t* name, uint32_t parent_idx, uint32_t fs_id, uint32_t fs_inode, uint32_t size) {
+    if (vfs_node_count >= VFS_MAX_NODES) { return 0xFFFFFFFF; }
+    uint32_t idx = vfs_node_count;
+    _vn_copy_name(idx, name);
+    _vn_write_u32(idx, VN_TYPE,   VN_FILE);
+    _vn_write_u32(idx, VN_SIZE,   size);
+    _vn_write_u32(idx, VN_FSID,   fs_id);
+    _vn_write_u32(idx, VN_INODE,  fs_inode);
+    _vn_write_u32(idx, VN_PARENT, parent_idx);
+    _vn_write_u32(idx, VN_FLAGS,  0x644);
+    vfs_node_count += 1;
+    return idx;
+}
+
+// ─── Create a directory node in the VFS ───────────────────────────────────────
+uint32_t vfs_create_dir(uint8_t* name, uint32_t parent_idx, uint32_t fs_id) {
+    if (vfs_node_count >= VFS_MAX_NODES) { return 0xFFFFFFFF; }
+    uint32_t idx = vfs_node_count;
+    _vn_copy_name(idx, name);
+    _vn_write_u32(idx, VN_TYPE,   VN_DIR);
+    _vn_write_u32(idx, VN_SIZE,   0);
+    _vn_write_u32(idx, VN_FSID,   fs_id);
+    _vn_write_u32(idx, VN_INODE,  idx);
+    _vn_write_u32(idx, VN_PARENT, parent_idx);
+    _vn_write_u32(idx, VN_FLAGS,  0x755);
+    vfs_node_count += 1;
+    return idx;
+}
+
+// ─── Find a node by name in a parent directory ────────────────────────────────
+uint32_t vfs_find(uint32_t parent_idx, uint8_t* name) {
+    uint32_t i = 0;
+    while (i < vfs_node_count) {
+        uint32_t parent = _vn_read_u32(i, VN_PARENT);
+        if (parent == parent_idx && i != 0) {
+            uint32_t node_name = _vn_name_ptr(i);
+            if (eq(node_name, name)) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return 0xFFFFFFFF; // Not found
+}
+
+// ─── List directory contents ───────────────────────────────────────────────────
+void vfs_ls(uint32_t parent_idx) {
+    set_color(COLOR_LIGHT_CYAN, COLOR_BLACK);
+    print("VFS Contents of node ");
+    print_u32(parent_idx);
+    print(":\n");
+    set_color(COLOR_WHITE, COLOR_BLACK);
+
+    uint32_t found = 0;
+    uint32_t i = 0;
+    while (i < vfs_node_count) {
+        uint32_t parent = _vn_read_u32(i, VN_PARENT);
+        uint32_t type_ = _vn_read_u32(i, VN_TYPE);
+        if (parent == parent_idx && i != parent_idx) {
+            uint32_t node_name = _vn_name_ptr(i);
+            if (type_ == VN_DIR) {
+                set_color(COLOR_LIGHT_BLUE, COLOR_BLACK);
+                print("  [DIR]  ");
+            } else {
+                set_color(COLOR_WHITE, COLOR_BLACK);
+                print("  [FILE] ");
+            }
+            print(node_name);
+            if (type_ == VN_FILE) {
+                print("  (");
+                print_u32(_vn_read_u32(i, VN_SIZE));
+                print(" bytes)");
+            }
+            print_char(10);
+            set_color(COLOR_WHITE, COLOR_BLACK);
+            found += 1;
+        }
+        i += 1;
+    }
+    if (found == 0) {
+        print("  (empty)\n");
+    }
+}
+
+// ─── Print full VFS tree ───────────────────────────────────────────────────────
+void vfs_tree() {
+    set_color(COLOR_LIGHT_CYAN, COLOR_BLACK);
+    print("/\n");
+    set_color(COLOR_WHITE, COLOR_BLACK);
+    uint32_t i = 1;
+    while (i < vfs_node_count) {
+        uint32_t type_ = _vn_read_u32(i, VN_TYPE);
+        uint32_t name = _vn_name_ptr(i);
+        print("  ");
+        if (type_ == VN_DIR) {
+            set_color(COLOR_LIGHT_BLUE, COLOR_BLACK);
+            print(name);
+            print("/");
+        } else {
+            print(name);
+        }
+        set_color(COLOR_WHITE, COLOR_BLACK);
+        print_char(10);
+        i += 1;
+    }
+}
+
+// ─── Populate standard Unix directory tree ────────────────────────────────────
+void vfs_populate_tree() {
+    // Standard Unix hierarchy
+    vfs_create_dir("bin",  0, FSID_RAMFS);   // Binaries
+    vfs_create_dir("dev",  0, FSID_RAMFS);   // Devices
+    vfs_create_dir("etc",  0, FSID_RAMFS);   // Config
+    vfs_create_dir("home", 0, FSID_RAMFS);   // User homes
+    vfs_create_dir("proc", 0, FSID_RAMFS);   // Process info
+    vfs_create_dir("tmp",  0, FSID_RAMFS);   // Temp files
+    vfs_create_dir("usr",  0, FSID_RAMFS);   // User programs
+    vfs_create_dir("var",  0, FSID_RAMFS);   // Variable data
+
+    // /etc/navi.conf  (example config file)
+    uint32_t etc_idx = vfs_find(0, "etc");
+    if (etc_idx != 0xFFFFFFFF) {
+        vfs_create_file("navi.conf", etc_idx, FSID_RAMFS, 1, 64);
+    }
+
+    // /home/root
+    uint32_t home_idx = vfs_find(0, "home");
+    if (home_idx != 0xFFFFFFFF) {
+        vfs_create_dir("root", home_idx, FSID_RAMFS);
+    }
+}
+
+
+
+
+// ─── fb.nux — VBE Linear Framebuffer Graphics Driver ─────────────────────────
+//
+// To switch from VGA text mode to graphical mode, we use the VESA BIOS
+// Extensions (VBE). The Multiboot2 spec allows us to request a framebuffer
+// from the bootloader, but for Multiboot1 (which we use), we must call
+// VBE int 0x10 via real-mode before switching to protected mode.
+//
+// Strategy: We modify boot.nux to call VBE mode-set BEFORE entering protected
+// mode, then pass the framebuffer info to the kernel via the Multiboot info
+// structure's framebuffer fields.
+//
+// Multiboot info struct framebuffer fields (at offset 88 from mbi pointer):
+//   +88:  framebuffer_addr  (u64 physical address of linear framebuffer)
+//   +96:  framebuffer_pitch (u32 bytes per row)
+//   +100: framebuffer_width (u32 width in pixels)
+//   +104: framebuffer_height(u32 height in pixels)
+//   +108: framebuffer_bpp   (u8 bits per pixel)
+//   +109: framebuffer_type  (u8 0=indexed, 1=RGB, 2=EGA text)
+//
+// The bootloader info pointer (EBX on entry) is passed from boot to kernel.
+// We store it at a fixed location for access from any module.
+//
+// For now we store the FB state in a global struct at 0x01900000.
+// Layout:
+//   +0:  addr   (u32 physical linear framebuffer address)
+//   +4:  pitch  (u32 bytes per row)
+//   +8:  width  (u32 pixels wide)
+//   +12: height (u32 pixels tall)
+//   +16: bpp    (u8  bits per pixel)
+//   +17: active (u8  1 if framebuffer is live, 0 if VGA text mode)
+
+uint8_t* FB_INFO = 0x01900000;
+uint32_t* MBI_STORE = 0x01900100;  // We stash the multiboot info pointer here
+
+uint32_t FB_OFF_ADDR = 0;
+uint32_t FB_OFF_PITCH = 4;
+uint32_t FB_OFF_WIDTH = 8;
+uint32_t FB_OFF_HEIGHT = 12;
+uint32_t FB_OFF_BPP = 16;
+uint32_t FB_OFF_ACTIVE = 17;
+
+// ─── Store multiboot info pointer (called from kernel entry) ──────────────────
+void fb_save_mbi(uint32_t mbi) {
+    __asm__("movl %0, (%1)\n\t" : : "r"(mbi), "r"(MBI_STORE));
+}
+
+// ─── Read framebuffer parameters from Multiboot info struct ───────────────────
+uint8_t fb_read_mbi() {
+    uint32_t mbi = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(mbi) : "r"(MBI_STORE));
+    // If nobody called fb_save_mbi(), MBI is 0 — nothing to read.
+    if (mbi == 0) { return 0; }
+
+    // Check Multiboot flags bit 12 (framebuffer info present)
+    uint32_t flags = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(flags) : "r"(mbi));
+    if ((flags & 0x1000) == 0) { return 0; }  // bit 12 not set
+
+    // Read framebuffer address (at mbi + 88, stored as u64 — we take low 32 bits)
+    uint32_t fb_addr_offset = 0;
+    __asm__("movl %1, %0\n\t" "addl $88, %0\n\t" : "=r"(fb_addr_offset) : "r"(mbi));
+    uint32_t addr = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(addr) : "r"(fb_addr_offset));
+
+    uint32_t pitch_off = 0;
+    __asm__("movl %1, %0\n\t" "addl $96, %0\n\t" : "=r"(pitch_off) : "r"(mbi));
+    uint32_t pitch = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(pitch) : "r"(pitch_off));
+
+    uint32_t width_off = 0;
+    __asm__("movl %1, %0\n\t" "addl $100, %0\n\t" : "=r"(width_off) : "r"(mbi));
+    uint32_t width = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(width) : "r"(width_off));
+
+    uint32_t height_off = 0;
+    __asm__("movl %1, %0\n\t" "addl $104, %0\n\t" : "=r"(height_off) : "r"(mbi));
+    uint32_t height = 0;
+    __asm__("movl (%1), %0\n\t" : "=r"(height) : "r"(height_off));
+
+    uint32_t bpp_off = 0;
+    __asm__("movl %1, %0\n\t" "addl $108, %0\n\t" : "=r"(bpp_off) : "r"(mbi));
+    uint8_t bpp = 0;
+    __asm__("movzbl (%1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(bpp) : "r"(bpp_off) : "%eax");
+
+    // Check type == 1 (RGB linear framebuffer)
+    uint32_t type_off = 0;
+    __asm__("movl %1, %0\n\t" "addl $109, %0\n\t" : "=r"(type_off) : "r"(mbi));
+    uint8_t fb_type = 0;
+    __asm__("movzbl (%1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(fb_type) : "r"(type_off) : "%eax");
+    if (fb_type != 1) { return 0; }  // Not an RGB linear framebuffer
+
+    // Store in our FB_INFO block
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_ADDR),   "r"(addr)   : "%eax");
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_PITCH),  "r"(pitch)  : "%eax");
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_WIDTH),  "r"(width)  : "%eax");
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_HEIGHT), "r"(height) : "%eax");
+
+    uint8_t active = 1;
+    __asm__("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movb %b2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_ACTIVE), "q"(active) : "%eax");
+
+    return 1;
+}
+
+// ─── Get framebuffer parameters ────────────────────────────────────────────────
+uint32_t fb_get_width() {
+    uint32_t v = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_WIDTH) : "%eax");
+    return v;
+}
+uint32_t fb_get_height() {
+    uint32_t v = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_HEIGHT) : "%eax");
+    return v;
+}
+uint32_t fb_get_pitch() {
+    uint32_t v = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_PITCH) : "%eax");
+    return v;
+}
+uint32_t fb_get_addr() {
+    uint32_t v = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_ADDR) : "%eax");
+    return v;
+}
+uint8_t fb_is_active() {
+    uint8_t v = 0;
+    __asm__("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movzbl (%%eax), %%ecx\n\t" "movb %%cl, %b0\n\t"
+        : "=q"(v) : "r"(FB_INFO), "r"(FB_OFF_ACTIVE) : "%eax", "%ecx");
+    return v;
+}
+
+// ─── Put a single pixel (32bpp) ───────────────────────────────────────────────
+void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (fb_is_active() == 0) { return; }
+    uint32_t pitch = fb_get_pitch();
+    uint32_t addr = fb_get_addr();
+
+    // pixel_offset = y * pitch + x * 4
+    uint32_t row = 0;
+    __asm__("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(row) : "r"(y), "r"(pitch));
+    uint32_t col = 0;
+    __asm__("movl %1, %0\n\t" "shll $2, %0\n\t" : "=r"(col) : "r"(x));
+    uint32_t pixel_addr = 0;
+    __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(pixel_addr) : "r"(addr), "r"(row), "r"(col));
+
+    __asm__("movl %1, (%0)\n\t" : : "r"(pixel_addr), "r"(color));
+}
+
+// ─── Fill a rectangle ──────────────────────────────────────────────────────────
+void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    uint32_t row = 0;
+    while (row < h) {
+        uint32_t col = 0;
+        while (col < w) {
+            fb_put_pixel(x + col, y + row, color);
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+// ─── Clear screen to a color ───────────────────────────────────────────────────
+void fb_clear(uint32_t color) {
+    if (fb_is_active() == 0) { return; }
+    fb_fill_rect(0, 0, fb_get_width(), fb_get_height(), color);
+}
+
+// ─── Draw a horizontal line ────────────────────────────────────────────────────
+void fb_draw_hline(uint32_t x, uint32_t y, uint32_t len, uint32_t color) {
+    uint32_t i = 0;
+    while (i < len) {
+        fb_put_pixel(x + i, y, color);
+        i += 1;
+    }
+}
+
+// ─── Draw a vertical line ──────────────────────────────────────────────────────
+void fb_draw_vline(uint32_t x, uint32_t y, uint32_t len, uint32_t color) {
+    uint32_t i = 0;
+    while (i < len) {
+        fb_put_pixel(x, y + i, color);
+        i += 1;
+    }
+}
+
+// ─── Draw a rectangle outline ─────────────────────────────────────────────────
+void fb_draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    fb_draw_hline(x, y,         w, color);   // top
+    fb_draw_hline(x, y + h - 1, w, color);   // bottom
+    fb_draw_vline(x,         y, h, color);   // left
+    fb_draw_vline(x + w - 1, y, h, color);   // right
+}
+
+
+
+
+
+// ─── font.nux — PSF (PC Screen Font) Bitmap Font Renderer ─────────────────────
+//
+// PSF1 font format:
+//   Header (4 bytes): magic[2], mode, charsize
+//   Glyph data: 256 glyphs, each `charsize` bytes tall, 8 pixels wide
+//
+// We embed a minimal 8x16 font for the ASCII printable range (32-127).
+// Each character is 8 wide x 16 tall = 16 bytes of bitmap data.
+//
+// Since we cannot load files from disk yet, we embed the IBM VGA 8x16 font
+// data directly. Each byte in the font is one row of 8 horizontal pixels,
+// bit 7 = leftmost pixel.
+
+uint32_t FONT_WIDTH = 8;
+uint32_t FONT_HEIGHT = 16;
+uint8_t* FONT_DATA = 0x01A00000;  // 256 * 16 = 4096 bytes
+uint8_t FONT_LOADED = 0;
+
+// Foreground/background colors for text rendering
+uint32_t TEXT_FG = 0xFFFFFF;  // White
+uint32_t TEXT_BG = 0x1E1E2E;  // Dark navy (Catppuccin Mocha base)
+
+// ─── Copy font bitmap data to FONT_DATA region ────────────────────────────────
+// This copies a minimal hardcoded font for ASCII 32-127.
+// A real implementation would load a PSF file from disk.
+void _copy_font_byte(uint32_t idx, uint8_t val) {
+    __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(FONT_DATA), "r"(idx), "q"(val));
+}
+
+void _load_minimal_font() {
+    // For each ASCII character, we populate very rough glyph shapes.
+    // Space (32) - all zeros (already zero from init)
+    // We won't embed all 96 glyphs here manually; instead we embed a
+    // procedural "box" glyph generator. A production kernel would load
+    // a real PSF font binary from the ramdisk.
+
+    // Generate simple "block" glyphs for letters (A-Z, a-z, 0-9):
+    // Row pattern: top border + sides only — readable as a filled rectangle
+    // Each char gets a unique pattern derived from its ASCII code
+    uint32_t ch = 32;
+    while (ch < 128) {
+        uint32_t base = ch * 16;
+        uint32_t i = 0;
+        while (i < 16) {
+            uint8_t byte_val = 0;
+            if (i == 0 || i == 15) {
+                // Full row (top/bottom border)
+                byte_val = 0xFF;
+            } else if (i == 1 || i == 14) {
+                // Near top/bottom
+                byte_val = 0x81;
+            } else {
+                // Middle rows - encode a bit of character identity
+                uint32_t row_pat = (ch & 0x3F) | 0x81;
+                if ((i & 1) == 0) { row_pat = 0x81 | ((ch >> 1) & 0x3C); }
+                byte_val = row_pat;
+            }
+            uint32_t idx = 0;
+            __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(base), "r"(i));
+            _copy_font_byte(idx, byte_val);
+            i += 1;
+        }
+        ch += 1;
+    }
+
+    // Special case: space (32) = all zeros
+    uint32_t sp = 0;
+    uint32_t space_base = 32 * 16;
+    while (sp < 16) {
+        uint32_t idx = 0;
+        __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(space_base), "r"(sp));
+        _copy_font_byte(idx, 0);
+        sp += 1;
+    }
+
+    FONT_LOADED = 1;
+}
+
+void init_font() {
+    _load_minimal_font();
+}
+
+// ─── Draw one character glyph to framebuffer ──────────────────────────────────
+void font_draw_char(uint8_t ch, uint32_t px, uint32_t py, uint32_t fg, uint32_t bg) {
+    if (FONT_LOADED == 0) { return; }
+
+    uint32_t ascii = ch;
+    if (ascii < 32 || ascii > 127) { ascii = 63; }  // fallback to '?'
+
+    uint32_t glyph_base = 0;
+    __asm__("movl %1, %0\n\t" "imull $16, %0\n\t" : "=r"(glyph_base) : "r"(ascii));
+
+    uint32_t row = 0;
+    while (row < FONT_HEIGHT) {
+        uint32_t glyph_idx = 0;
+        __asm__("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(glyph_idx) : "r"(glyph_base), "r"(row));
+        uint8_t glyph_byte = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(glyph_byte) : "r"(FONT_DATA), "r"(glyph_idx) : "%eax");
+
+        uint32_t col = 0;
+        while (col < FONT_WIDTH) {
+            // Check bit (7 - col) of glyph_byte
+            uint32_t shift = 7 - col;
+            uint8_t bit = 0;
+            uint32_t zero_r = 0;
+            __asm__("movzbl %b2, %%eax\n\t" "shrl %b3, %%eax\n\t" "andl $1, %%eax\n\t" "movb %%al, %b0\n\t"
+                : "=q"(bit) : "r"(zero_r), "q"(glyph_byte), "c"(shift) : "%eax");
+            if (bit != 0) {
+                fb_put_pixel(px + col, py + row, fg);
+            } else {
+                fb_put_pixel(px + col, py + row, bg);
+            }
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+// ─── Draw a string of text ─────────────────────────────────────────────────────
+void font_draw_string(uint8_t* s, uint32_t px, uint32_t py, uint32_t fg, uint32_t bg) {
+    uint32_t i = 0;
+    uint32_t x = px;
+    while (true) {
+        uint8_t c = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(c) : "r"(s), "r"(i) : "%eax");
+        if (c == 0) { break; }
+        if (c == 10) {  // newline
+            // For a real terminal, handle this properly
+            break;
+        }
+        font_draw_char(c, x, py, fg, bg);
+        x += FONT_WIDTH;
+        i += 1;
+    }
+}
+
+
+
+
+
+
+// ─── gui.nux — Graphical Desktop UI (Window Manager + App Shells) ─────────────
+//
+// Desktop layout:
+//   [Taskbar] — top bar, 28px tall: OS logo + open apps + clock
+//   [Desktop] — the main area with a wallpaper background
+//   [Dock]    — bottom bar, 48px: shortcut icons
+//
+// Color palette: Catppuccin Mocha
+//   Base:     0x1E1E2E  (dark navy background)
+//   Mantle:   0x181825  (darker panels)
+//   Surface0: 0x313244  (elevated surfaces)
+//   Overlay0: 0x6C7086  (muted text)
+//   Text:     0xCDD6F4  (primary text)
+//   Blue:     0x89B4FA
+//   Green:    0xA6E3A1
+//   Red:      0xF38BA8
+//   Yellow:   0xF9E2AF
+//   Mauve:    0xCBA6F7
+
+uint32_t C_BASE = 0x1E1E2E;
+uint32_t C_MANTLE = 0x181825;
+uint32_t C_SURFACE = 0x313244;
+uint32_t C_OVERLAY = 0x6C7086;
+uint32_t C_TEXT = 0xCDD6F4;
+uint32_t C_BLUE = 0x89B4FA;
+uint32_t C_GREEN = 0xA6E3A1;
+uint32_t C_RED = 0xF38BA8;
+uint32_t C_YELLOW = 0xF9E2AF;
+uint32_t C_MAUVE = 0xCBA6F7;
+uint32_t C_WHITE = 0xFFFFFF;
+
+// Desktop state
+uint32_t TASKBAR_H = 28;
+uint32_t DOCK_H = 48;
+
+// ─── Draw top taskbar ──────────────────────────────────────────────────────────
+void gui_draw_taskbar() {
+    uint32_t w = fb_get_width();
+
+    // Taskbar background
+    fb_fill_rect(0, 0, w, TASKBAR_H, C_MANTLE);
+
+    // Bottom border
+    fb_draw_hline(0, TASKBAR_H - 1, w, C_SURFACE);
+
+    // Logo text "Navi OS"
+    font_draw_string("Navi OS", 8, 6, C_MAUVE, C_MANTLE);
+
+    // Separator
+    fb_draw_vline(80, 4, TASKBAR_H - 8, C_SURFACE);
+
+    // Date/time placeholder
+    font_draw_string("00:00  Mon 01 Jan", w - 144, 6, C_OVERLAY, C_MANTLE);
+}
+
+// ─── Draw bottom dock ──────────────────────────────────────────────────────────
+void gui_draw_dock() {
+    uint32_t w = fb_get_width();
+    uint32_t h = fb_get_height();
+    uint32_t dock_y = 0;
+    __asm__("movl %1, %0\n\t" "subl %2, %0\n\t" : "=r"(dock_y) : "r"(h), "r"(DOCK_H));
+
+    // Dock background
+    fb_fill_rect(0, dock_y, w, DOCK_H, C_MANTLE);
+    fb_draw_hline(0, dock_y, w, C_SURFACE);
+
+    // Dock icons (drawn as colored squares with labels)
+    uint32_t icons_x = 8;
+    uint32_t icon_size = 36;
+    uint32_t icon_y = 0;
+    __asm__("movl %1, %0\n\t" "addl $6, %0\n\t" : "=r"(icon_y) : "r"(dock_y));
+
+    // Terminal icon (blue)
+    fb_fill_rect(icons_x,        icon_y, icon_size, icon_size, C_BLUE);
+    font_draw_string(">_", icons_x + 10, icon_y + 12, C_MANTLE, C_BLUE);
+
+    // Files icon (yellow)
+    fb_fill_rect(icons_x + 44,   icon_y, icon_size, icon_size, C_YELLOW);
+    font_draw_string("FM", icons_x + 54, icon_y + 12, C_MANTLE, C_YELLOW);
+
+    // Notepad icon (green)
+    fb_fill_rect(icons_x + 88,   icon_y, icon_size, icon_size, C_GREEN);
+    font_draw_string("NP", icons_x + 98, icon_y + 12, C_MANTLE, C_GREEN);
+
+    // Settings icon (mauve)
+    fb_fill_rect(icons_x + 132,  icon_y, icon_size, icon_size, C_MAUVE);
+    font_draw_string("ST", icons_x + 142, icon_y + 12, C_MANTLE, C_MAUVE);
+}
+
+// ─── Draw wallpaper (gradient) ────────────────────────────────────────────────
+void gui_draw_wallpaper() {
+    uint32_t w = fb_get_width();
+    uint32_t h = fb_get_height();
+    uint32_t content_y = TASKBAR_H;
+    uint32_t content_h = 0;
+    __asm__("movl %1, %0\n\t" "subl %2, %0\n\t" "subl %3, %0\n\t"
+        : "=r"(content_h) : "r"(h), "r"(TASKBAR_H), "r"(DOCK_H));
+
+    // Simple vertical gradient from C_BASE to a slightly lighter shade
+    uint32_t row = 0;
+    while (row < content_h) {
+        // Blend factor: 0..255 as row goes top to bottom
+        uint32_t blend = (row * 40) / content_h;
+        // Base color 0x1E1E2E — add blend to each channel slightly
+        uint32_t r = 0x1E + blend;
+        uint32_t g = 0x1E + blend;
+        uint32_t b = 0x2E + (blend * 2);
+        if (r > 0xFF) { r = 0xFF; }
+        if (g > 0xFF) { g = 0xFF; }
+        if (b > 0xFF) { b = 0xFF; }
+        uint32_t color = 0;
+        __asm__("movl %1, %0\n\t" "shll $16, %0\n\t" "orl %2, %0\n\t" "shll $8, %0\n\t" "orl %3, %0\n\t"
+            : "=r"(color) : "r"(r), "r"(g), "r"(b));
+
+        fb_draw_hline(0, content_y + row, w, color);
+        row += 1;
+    }
+}
+
+// ─── Draw a window frame ───────────────────────────────────────────────────────
+void gui_draw_window(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t* title) {
+    // Window body
+    fb_fill_rect(x, y, w, h, C_BASE);
+
+    // Title bar
+    fb_fill_rect(x, y, w, 24, C_SURFACE);
+
+    // Title bar border
+    fb_draw_hline(x, y + 24, w, C_OVERLAY);
+
+    // Window border
+    fb_draw_rect(x, y, w, h, C_SURFACE);
+
+    // Title text
+    font_draw_string(title, x + 8, y + 4, C_TEXT, C_SURFACE);
+
+    // Close button (red dot at top-right)
+    fb_fill_rect(x + w - 18, y + 6, 12, 12, C_RED);
+}
+
+// ─── Draw Terminal window ──────────────────────────────────────────────────────
+void gui_draw_terminal() {
+    uint32_t w = fb_get_width();
+    uint32_t h = fb_get_height();
+
+    uint32_t win_x = 40;
+    uint32_t win_y = 40;
+    uint32_t win_w = 0;
+    uint32_t win_h = 0;
+    __asm__("movl %1, %0\n\t" "subl $80, %0\n\t"  : "=r"(win_w) : "r"(w));
+    __asm__("movl %1, %0\n\t" "subl $120, %0\n\t" : "=r"(win_h) : "r"(h));
+
+    gui_draw_window(win_x, win_y, win_w, win_h, "Terminal — Navi OS");
+
+    // Terminal content area background
+    fb_fill_rect(win_x + 1, win_y + 25, win_w - 2, win_h - 26, C_MANTLE);
+
+    // Draw some fake terminal lines
+    font_draw_string("Welcome to Navi OS v1.0", win_x + 8, win_y + 32, C_GREEN, C_MANTLE);
+    font_draw_string("Type 'help' for commands.", win_x + 8, win_y + 50, C_TEXT, C_MANTLE);
+    font_draw_string("root@navi:/> _", win_x + 8, win_y + 76, C_BLUE, C_MANTLE);
+}
+
+// ─── Full desktop render ───────────────────────────────────────────────────────
+void gui_render_desktop() {
+    if (fb_is_active() == 0) {
+        print("[GUI] No framebuffer available. Run in VBE mode.\n");
+        print("[GUI] Add 'set gfxmode 1024x768x32' to grub.cfg and rebuild.\n");
+        return;
+    }
+
+    fb_clear(C_BASE);
+    gui_draw_wallpaper();
+    gui_draw_taskbar();
+    gui_draw_dock();
+    gui_draw_terminal();
+}
+
+// ─── Initialize GUI subsystem ─────────────────────────────────────────────────
+void init_gui() {
+    init_font();
+    print("[GUI] Font engine initialized.\n");
+}
+
+
+
+
+// ─── desktop.nux — Graphical Desktop Interface Stub ───────────────────────────
+//
+// To achieve a true Desktop environment, the following must be implemented:
+// 1. Multiboot VBE initialization (FrameBuffer instead of VGA text mode)
+// 2. Pixel drawing routines (put_pixel, draw_rect, draw_line)
+// 3. Font rendering (bitmap fonts, e.g., PC Screen Font / PSF)
+// 4. A Window Manager (compositor, Z-order, clipping)
+// 5. Mouse driver (PS/2 or USB HID)
+
+uint8_t desktop_active = 0;
+
+void init_desktop() {
+    // Currently a stub. In the future, this will switch from VGA to VBE Framebuffer.
+    print("Initializing Graphical Desktop Environment...\n");
+    print("Loading Display Server...\n");
+    print("Loading Window Manager...\n");
+    desktop_active = 1;
+}
+
+void draw_window(uint8_t* title, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    // Stub for window drawing
+}
+
+void start_desktop_mode() {
+    init_desktop();
+    print("\n[ERROR]: Missing VESA/VBE Framebuffer Graphics Driver!\n");
+    print("Navi OS is currently running in VGA Text Mode (80x25 characters).\n");
+    print("To use the Desktop GUI, Mesa drivers and a linear framebuffer are required.\n");
+    desktop_active = 0;
+}
+
+
+
+
+
+// ─── image_viewer.nux — Photo Viewer App Stub ─────────────────────────────────
+//
+// A program to view images inside the shell / desktop mode, supporting:
+// - Zoom in / Zoom out
+// - Panning (Right/Left/Top/Bottom)
+//
+// Requires:
+// 1. Image decoding libraries (PNG, JPEG, BMP)
+// 2. Framebuffer Graphics (VBE)
+
+void open_image(uint8_t* filepath) {
+    set_color(COLOR_LIGHT_MAGENTA, COLOR_BLACK);
+    print("--- Navi Photo Viewer ---\n");
+    set_color(COLOR_WHITE, COLOR_BLACK);
+    
+    print("Opening image: ");
+    print(filepath);
+    print("\n");
+    
+    if (desktop_active == 0) {
+        print("[ERROR]: Cannot display image in VGA Text Mode!\n");
+        print("Please switch to graphical Desktop Mode first.\n");
+        return;
+    }
+    
+    print("Controls: [+] Zoom In  [-] Zoom Out  [Arrow Keys] Pan Image\n");
+    // Image decoding and framebuffer blitting logic would go here.
+}
+
+
+
+
+
+
 
 
 
@@ -2800,6 +4405,13 @@ void filemanager_open() {
 
 
 
+
+
+
+
+
+
+
 // ─── shell.nux — Navi OS Interactive Shell ────────────────────────────────────
 //
 // Input loop: reads one key at a time via read_key().
@@ -2830,10 +4442,28 @@ void filemanager_open() {
 //   tail <file>   Print last 10 lines of file
 //   wc <file>     Print newline, word, and byte counts
 //   sleep <ms>    Halt CPU for rough duration
+//   ps            List processes
+//   kill <pid>    Kill a process
+//   bg <cmd>      Start process in background
+//   fg <pid>      Bring process to foreground
+//   jobs          List background jobs
+//   free          Show memory usage
+//   cc <file>     Compile and run a C/C++ file (LLVM stub)
+//   desktop       Switch to Graphical Desktop Mode
+//   view <file>   Open Photo Viewer
+//   threads       List all threads
+//   vfs-ls        List VFS root directory
+//   vfs-tree      Show full VFS directory tree
+//   uptime        Show ticks since boot
+//   cd <dir>      Change directory
 //   halt          Halt the CPU
 
 uint8_t* CMD_BUF = 0x00200000;    // 64 KB command buffer
 uint32_t CMD_MAX = 511;
+
+uint8_t* DIR_BUF = 0x00210000;    // Buffer for current directory string
+uint8_t* current_dir = "/";
+
 
 void _shell_putch(uint8_t* buf, uint32_t idx, uint8_t ch) {
     __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(buf), "r"(idx), "q"(ch));
@@ -2879,7 +4509,7 @@ uint32_t _read_line() {
         // ── Ctrl+C: interrupt / clear line ────────────────────────────────
         if (ascii == 3) {  // Ctrl+C = ASCII ETX
             print("^C\n");
-            print("root@navi:~// ");
+            print("root@navi:~> ");
             idx = 0;
             continue;
         }
@@ -2887,7 +4517,7 @@ uint32_t _read_line() {
         // ── Ctrl+L: clear screen ───────────────────────────────────────────
         if (ascii == 12) {  // Ctrl+L = ASCII FF
             clear();
-            print("root@navi:~// ");
+            print("root@navi:~> ");
             // Reprint what was typed so far
             uint32_t j = 0;
             while (j < idx) {
@@ -3115,6 +4745,86 @@ void _cmd_wc(uint8_t* fname) {
     print(" "); print(fname); print("\n");
 }
 
+uint32_t _parse_int(uint8_t* s) {
+    uint32_t res = 0;
+    uint32_t i = 0;
+    while (true) {
+        uint8_t c = 0;
+        __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(s), "r"(i) : "%eax");
+        if (c < 48 || c > 57) { break; }
+        res = (res * 10) + (c - 48);
+        i += 1;
+    }
+    return res;
+}
+
+void _cmd_kill(uint8_t* args) {
+    uint32_t pid = _parse_int(args);
+    if (pid == 0) {
+        print("kill: invalid pid\n");
+        return;
+    }
+    if (pid == 1) {
+        print("kill: cannot kill init/shell process\n");
+        return;
+    }
+    uint32_t ok = kill_process(pid);
+    if (ok == 1) {
+        print("Process killed.\n");
+    } else {
+        print("kill: no such process\n");
+    }
+}
+
+void _cmd_bg(uint8_t* args) {
+    uint32_t pid = create_process(args);
+    if (pid != 0) {
+        print("["); print_u32(pid); print("] ");
+        print(args);
+        print("\n");
+    } else {
+        print("bg: cannot create process (max limit reached)\n");
+    }
+}
+
+void _cmd_fg(uint8_t* args) {
+    uint32_t pid = _parse_int(args);
+    if (pid == 0) { print("fg: invalid pid\n"); return; }
+    // Dummy implementation for now, just pretend to resume it
+    print("Resumed process ");
+    print_u32(pid);
+    print(" in foreground.\n");
+}
+
+void _cmd_cd(uint8_t* args) {
+    // Since ramfs is flat right now, just pretend to change directory
+    if (eq(args, "/") || eq(args, "..")) {
+        current_dir = "/";
+    } else {
+        // Copy to DIR_BUF so it isn't overwritten by CMD_BUF
+        uint32_t i = 0;
+        while (true) {
+            uint8_t c = 0;
+            __asm__("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(args), "r"(i) : "%eax");
+            __asm__("movb %b2, (%0,%1,1)\n\t" : : "r"(DIR_BUF), "r"(i), "q"(c));
+            if (c == 0) { break; }
+            i += 1;
+        }
+        current_dir = DIR_BUF;
+    }
+}
+
+void _cmd_cc(uint8_t* args) {
+    set_color(COLOR_LIGHT_CYAN, COLOR_BLACK);
+    print("LLVM JIT Compiler & Executor (Stub)\n");
+    set_color(COLOR_WHITE, COLOR_BLACK);
+    print("Analyzing source: ");
+    print(args);
+    print("\n");
+    print("Error: LLVM backend and standard library not yet ported to Nux!\n");
+    print("To implement fully in Nux, we must bootstrap a native Nux IR compiler.\n");
+}
+
 void _cmd_help() {
     set_color(COLOR_LIGHT_CYAN, COLOR_BLACK);
     print("Navi OS — Available Commands\n");
@@ -3138,6 +4848,16 @@ void _cmd_help() {
     print("  wc <file>      Count words/lines\n");
     print("  edit <file>    Open Nux Editor (F1=Nano F2=Vim)\n");
     print("  fm             Open Nux File Manager\n");
+    print("  ps             List running processes\n");
+    print("  kill <pid>     Kill a process by PID\n");
+    print("  bg <cmd>       Run command as background job\n");
+    print("  fg <pid>       Bring job to foreground\n");
+    print("  jobs           List background jobs\n");
+    print("  free           Show memory usage\n");
+    print("  cc <file>      Compile/run C/C++ file (LLVM stub)\n");
+    print("  desktop        Start Graphical UI (Desktop Mode)\n");
+    print("  view <file>    Open image in Photo Viewer\n");
+    print("  cd <dir>       Change working directory\n");
     print("  sleep <ms>     Sleep (dummy loop)\n");
     print("  halt           Halt the system\n");
     set_color(COLOR_DARK_GREY, COLOR_BLACK);
@@ -3159,7 +4879,11 @@ void start_shell() {
 
     while (true) {
         set_color(COLOR_LIGHT_GREEN, COLOR_BLACK);
-        print("root@navi:~// ");
+        print("root@navi:");
+        set_color(COLOR_LIGHT_BLUE, COLOR_BLACK);
+        print(current_dir);
+        set_color(COLOR_LIGHT_GREEN, COLOR_BLACK);
+        print("> ");
         set_color(COLOR_WHITE, COLOR_BLACK);
 
         uint32_t len = _read_line();
@@ -3172,7 +4896,8 @@ void start_shell() {
         } else if (eq(CMD_BUF, "clear") || eq(CMD_BUF, "cls")) {
             clear();
         } else if (eq(CMD_BUF, "pwd")) {
-            print("/\n");
+            print(current_dir);
+            print_char(10);
         } else if (eq(CMD_BUF, "whoami")) {
             print("root\n");
         } else if (eq(CMD_BUF, "uname") || eq(CMD_BUF, "uname -a")) {
@@ -3209,6 +4934,37 @@ void start_shell() {
             _cmd_wc(CMD_BUF + 3);
         } else if (eq(CMD_BUF, "df")) {
             _cmd_df();
+        } else if (eq(CMD_BUF, "free")) {
+            print("Total RAM:   32 MB (Mocked)\n");
+            print("Heap Used:   ");
+            print_u32(get_allocated_memory());
+            print(" bytes\n");
+        } else if (starts_with(CMD_BUF, "cc ")) {
+            _cmd_cc(CMD_BUF + 3);
+        } else if (eq(CMD_BUF, "ps") || eq(CMD_BUF, "jobs")) {
+            print_ps();
+        } else if (starts_with(CMD_BUF, "kill ")) {
+            _cmd_kill(CMD_BUF + 5);
+        } else if (starts_with(CMD_BUF, "bg ")) {
+            _cmd_bg(CMD_BUF + 3);
+        } else if (starts_with(CMD_BUF, "fg ")) {
+            _cmd_fg(CMD_BUF + 3);
+        } else if (starts_with(CMD_BUF, "cd ")) {
+            _cmd_cd(CMD_BUF + 3);
+        } else if (eq(CMD_BUF, "desktop")) {
+            start_desktop_mode();
+        } else if (starts_with(CMD_BUF, "view ")) {
+            open_image(CMD_BUF + 5);
+        } else if (eq(CMD_BUF, "threads")) {
+            print_threads();
+        } else if (eq(CMD_BUF, "vfs-ls")) {
+            vfs_ls(0);
+        } else if (eq(CMD_BUF, "vfs-tree")) {
+            vfs_tree();
+        } else if (eq(CMD_BUF, "uptime")) {
+            print("Ticks since boot: ");
+            print_u32(get_ticks());
+            print(" (100 Hz = 10ms/tick)\n");
         } else if (starts_with(CMD_BUF, "sleep ")) {
             // Dummy delay loop
             uint32_t k = 0;
@@ -3233,16 +4989,49 @@ void start_shell() {
 
 
 
+
+
+
+
+
+
+
+
+
 // The entry point called by boot.s
 
 void kmain() {
-    // Initialize hardware drivers
+    // 1. Memory and process management
     clear();
-    
-    // Hand off execution to the interactive shell
+    init_memory();
+    init_processes();
+
+    // 2. Thread management
+    init_threads();
+
+    // 3. Hardware interrupt subsystem (PIC + PIT timer, no sti yet)
+    init_interrupts();
+
+    // 4. Virtual File System
+    init_vfs();
+    vfs_populate_tree();
+
+    // 5. Framebuffer / GUI
+    // Save the Multiboot info pointer (EBX from bootloader) so fb can read it.
+    // GRUB puts the MBI address in EBX; boot.nux passes it through kmain's arg.
+    // For now we pass 0 (text mode fallback) until we wire EBX through boot.nux.
+    fb_save_mbi(0);
+    uint32_t fb_ok = fb_read_mbi();
+    if (fb_ok == 1) {
+        init_gui();
+        gui_render_desktop();
+    }
+
+    // 6. Hand off to interactive text shell
     start_shell();
-    
-    // We should never return here, but just in case:
+
+    // Should never return
     halt_forever();
 }
+
 

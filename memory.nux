@@ -1,0 +1,47 @@
+@[no_std]
+import std::hw;
+
+# ─── memory.nux — Memory Management ──────────────────────────────────────────
+#
+# A basic physical memory manager and heap allocator for Navi OS.
+# For simplicity in this early stage, we use a bump allocator for the heap,
+# starting at 0x02000000 (32MB mark).
+
+var HEAP_BASE: *u8 = 0x02000000;
+var current_heap: *u8 = 0x02000000;
+
+# Memory Management initialization
+func init_memory() {
+    current_heap = HEAP_BASE;
+}
+
+# Simple malloc (bump allocator)
+func mem_alloc(size: u32) -> *u8 {
+    var ptr = current_heap;
+    
+    # Calculate new heap pointer
+    var new_heap: u32 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(new_heap) : "r"(current_heap), "r"(size));
+    
+    # Align to 4 bytes
+    var remainder = new_heap % 4;
+    if (remainder != 0) {
+        new_heap = new_heap + (4 - remainder);
+    }
+    
+    current_heap = new_heap as *u8;
+    return ptr;
+}
+
+# Free (no-op in a bump allocator)
+func mem_free(ptr: *u8) {
+    # In a full memory manager, we would add the block to a free list.
+    # Currently a no-op since it's a bump allocator.
+}
+
+# Get total allocated memory
+func get_allocated_memory() -> u32 {
+    var diff: u32 = 0;
+    asm("movl %1, %0\n\t" "subl %2, %0\n\t" : "=r"(diff) : "r"(current_heap), "r"(HEAP_BASE));
+    return diff;
+}

@@ -1,0 +1,205 @@
+@[no_std]
+import std::io;
+
+# ─── fb.nux — VBE Linear Framebuffer Graphics Driver ─────────────────────────
+#
+# To switch from VGA text mode to graphical mode, we use the VESA BIOS
+# Extensions (VBE). The Multiboot2 spec allows us to request a framebuffer
+# from the bootloader, but for Multiboot1 (which we use), we must call
+# VBE int 0x10 via real-mode before switching to protected mode.
+#
+# Strategy: We modify boot.nux to call VBE mode-set BEFORE entering protected
+# mode, then pass the framebuffer info to the kernel via the Multiboot info
+# structure's framebuffer fields.
+#
+# Multiboot info struct framebuffer fields (at offset 88 from mbi pointer):
+#   +88:  framebuffer_addr  (u64 physical address of linear framebuffer)
+#   +96:  framebuffer_pitch (u32 bytes per row)
+#   +100: framebuffer_width (u32 width in pixels)
+#   +104: framebuffer_height(u32 height in pixels)
+#   +108: framebuffer_bpp   (u8 bits per pixel)
+#   +109: framebuffer_type  (u8 0=indexed, 1=RGB, 2=EGA text)
+#
+# The bootloader info pointer (EBX on entry) is passed from boot to kernel.
+# We store it at a fixed location for access from any module.
+#
+# For now we store the FB state in a global struct at 0x01900000.
+# Layout:
+#   +0:  addr   (u32 physical linear framebuffer address)
+#   +4:  pitch  (u32 bytes per row)
+#   +8:  width  (u32 pixels wide)
+#   +12: height (u32 pixels tall)
+#   +16: bpp    (u8  bits per pixel)
+#   +17: active (u8  1 if framebuffer is live, 0 if VGA text mode)
+
+var FB_INFO:   *u8 = 0x01900000;
+var MBI_STORE: *u32 = 0x01900100;  # We stash the multiboot info pointer here
+
+var FB_OFF_ADDR:   u32 = 0;
+var FB_OFF_PITCH:  u32 = 4;
+var FB_OFF_WIDTH:  u32 = 8;
+var FB_OFF_HEIGHT: u32 = 12;
+var FB_OFF_BPP:    u32 = 16;
+var FB_OFF_ACTIVE: u32 = 17;
+
+# ─── Store multiboot info pointer (called from kernel entry) ──────────────────
+func fb_save_mbi(mbi: u32) {
+    asm("movl %0, (%1)\n\t" : : "r"(mbi), "r"(MBI_STORE));
+}
+
+# ─── Read framebuffer parameters from Multiboot info struct ───────────────────
+func fb_read_mbi() -> u8 {
+    var mbi: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(mbi) : "r"(MBI_STORE));
+    # If nobody called fb_save_mbi(), MBI is 0 — nothing to read.
+    if (mbi == 0) { return 0; }
+
+    # Check Multiboot flags bit 12 (framebuffer info present)
+    var flags: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(flags) : "r"(mbi));
+    if ((flags & 0x1000) == 0) { return 0; }  # bit 12 not set
+
+    # Read framebuffer address (at mbi + 88, stored as u64 — we take low 32 bits)
+    var fb_addr_offset: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $88, %0\n\t" : "=r"(fb_addr_offset) : "r"(mbi));
+    var addr: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(addr) : "r"(fb_addr_offset));
+
+    var pitch_off: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $96, %0\n\t" : "=r"(pitch_off) : "r"(mbi));
+    var pitch: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(pitch) : "r"(pitch_off));
+
+    var width_off: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $100, %0\n\t" : "=r"(width_off) : "r"(mbi));
+    var width: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(width) : "r"(width_off));
+
+    var height_off: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $104, %0\n\t" : "=r"(height_off) : "r"(mbi));
+    var height: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(height) : "r"(height_off));
+
+    var bpp_off: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $108, %0\n\t" : "=r"(bpp_off) : "r"(mbi));
+    var bpp: u8 = 0;
+    asm("movzbl (%1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(bpp) : "r"(bpp_off) : "%eax");
+
+    # Check type == 1 (RGB linear framebuffer)
+    var type_off: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $109, %0\n\t" : "=r"(type_off) : "r"(mbi));
+    var fb_type: u8 = 0;
+    asm("movzbl (%1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(fb_type) : "r"(type_off) : "%eax");
+    if (fb_type != 1) { return 0; }  # Not an RGB linear framebuffer
+
+    # Store in our FB_INFO block
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_ADDR),   "r"(addr)   : "%eax");
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_PITCH),  "r"(pitch)  : "%eax");
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_WIDTH),  "r"(width)  : "%eax");
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_HEIGHT), "r"(height) : "%eax");
+
+    var active: u8 = 1;
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movb %b2, (%%eax)\n\t"
+        : : "r"(FB_INFO), "r"(FB_OFF_ACTIVE), "q"(active) : "%eax");
+
+    return 1;
+}
+
+# ─── Get framebuffer parameters ────────────────────────────────────────────────
+func fb_get_width()  -> u32 {
+    var v: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_WIDTH) : "%eax");
+    return v;
+}
+func fb_get_height() -> u32 {
+    var v: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_HEIGHT) : "%eax");
+    return v;
+}
+func fb_get_pitch()  -> u32 {
+    var v: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_PITCH) : "%eax");
+    return v;
+}
+func fb_get_addr()   -> u32 {
+    var v: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(v) : "r"(FB_INFO), "r"(FB_OFF_ADDR) : "%eax");
+    return v;
+}
+func fb_is_active()  -> u8 {
+    var v: u8 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movzbl (%%eax), %%ecx\n\t" "movb %%cl, %b0\n\t"
+        : "=q"(v) : "r"(FB_INFO), "r"(FB_OFF_ACTIVE) : "%eax", "%ecx");
+    return v;
+}
+
+# ─── Put a single pixel (32bpp) ───────────────────────────────────────────────
+func fb_put_pixel(x: u32, y: u32, color: u32) {
+    if (fb_is_active() == 0) { return; }
+    var pitch = fb_get_pitch();
+    var addr  = fb_get_addr();
+
+    # pixel_offset = y * pitch + x * 4
+    var row: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(row) : "r"(y), "r"(pitch));
+    var col: u32 = 0;
+    asm("movl %1, %0\n\t" "shll $2, %0\n\t" : "=r"(col) : "r"(x));
+    var pixel_addr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(pixel_addr) : "r"(addr), "r"(row), "r"(col));
+
+    asm("movl %1, (%0)\n\t" : : "r"(pixel_addr), "r"(color));
+}
+
+# ─── Fill a rectangle ──────────────────────────────────────────────────────────
+func fb_fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
+    var row: u32 = 0;
+    while (row < h) {
+        var col: u32 = 0;
+        while (col < w) {
+            fb_put_pixel(x + col, y + row, color);
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+# ─── Clear screen to a color ───────────────────────────────────────────────────
+func fb_clear(color: u32) {
+    if (fb_is_active() == 0) { return; }
+    fb_fill_rect(0, 0, fb_get_width(), fb_get_height(), color);
+}
+
+# ─── Draw a horizontal line ────────────────────────────────────────────────────
+func fb_draw_hline(x: u32, y: u32, len: u32, color: u32) {
+    var i: u32 = 0;
+    while (i < len) {
+        fb_put_pixel(x + i, y, color);
+        i += 1;
+    }
+}
+
+# ─── Draw a vertical line ──────────────────────────────────────────────────────
+func fb_draw_vline(x: u32, y: u32, len: u32, color: u32) {
+    var i: u32 = 0;
+    while (i < len) {
+        fb_put_pixel(x, y + i, color);
+        i += 1;
+    }
+}
+
+# ─── Draw a rectangle outline ─────────────────────────────────────────────────
+func fb_draw_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
+    fb_draw_hline(x, y,         w, color);   # top
+    fb_draw_hline(x, y + h - 1, w, color);   # bottom
+    fb_draw_vline(x,         y, h, color);   # left
+    fb_draw_vline(x + w - 1, y, h, color);   # right
+}

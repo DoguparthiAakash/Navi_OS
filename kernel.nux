@@ -5,16 +5,49 @@ import std::io;
 import shell;
 import fs;
 import ramfs;
+import process;
+import memory;
+import disk;
+import pit;
+import thread;
+import vfs;
+import fb;
+import font;
+import gui;
 
 # The entry point called by boot.s
 @[entry]
 func kmain() {
-    # Initialize hardware drivers
+    # 1. Memory and process management
     io::clear();
-    
-    # Hand off execution to the interactive shell
+    memory::init_memory();
+    process::init_processes();
+
+    # 2. Thread management
+    thread::init_threads();
+
+    # 3. Hardware interrupt subsystem (PIC + PIT timer, no sti yet)
+    pit::init_interrupts();
+
+    # 4. Virtual File System
+    vfs::init_vfs();
+    vfs::vfs_populate_tree();
+
+    # 5. Framebuffer / GUI
+    # Save the Multiboot info pointer (EBX from bootloader) so fb can read it.
+    # GRUB puts the MBI address in EBX; boot.nux passes it through kmain's arg.
+    # For now we pass 0 (text mode fallback) until we wire EBX through boot.nux.
+    fb::fb_save_mbi(0);
+    var fb_ok = fb::fb_read_mbi();
+    if (fb_ok == 1) {
+        gui::init_gui();
+        gui::gui_render_desktop();
+    }
+
+    # 6. Hand off to interactive text shell
     shell::start_shell();
-    
-    # We should never return here, but just in case:
+
+    # Should never return
     hw::halt_forever();
 }
+

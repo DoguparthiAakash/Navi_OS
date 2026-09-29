@@ -1,0 +1,171 @@
+@[no_std]
+
+import std::string;
+import std::io;
+
+# ─── process.nux — Process, Job, and Thread Management ────────────────────────
+#
+# A basic process table for cooperative multitasking/job tracking.
+# Layout in low memory (above ramfs):
+#   0x01300000 - proc_names (16 bytes * 32 = 512 bytes)
+#   0x01300200 - proc_pids (4 bytes * 32 = 128 bytes)
+#   0x01300300 - proc_states (1 byte * 32 = 32 bytes) (0=free, 1=running, 2=sleeping, 3=stopped)
+#   0x01300400 - proc_threads (4 bytes * 32 = 128 bytes) (thread count)
+
+var MAX_PROCESSES: u32 = 32;
+var PROC_NAMES: *u8 = 0x01300000;
+var PROC_PIDS: *u32 = 0x01300200;
+var PROC_STATES: *u8 = 0x01300300;
+var PROC_THREADS: *u32 = 0x01300400;
+
+var STATE_FREE: u8 = 0;
+var STATE_RUNNING: u8 = 1;
+var STATE_SLEEPING: u8 = 2;
+var STATE_STOPPED: u8 = 3;
+
+var next_pid: u32 = 1;
+var current_task_index: u32 = 0;
+
+func _process_copy_name(dst: *u8, src: *u8) {
+    var i: u32 = 0;
+    while (i < 16) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(src), "r"(i) : "%eax");
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(dst), "r"(i), "q"(c));
+        if (c == 0) { break; }
+        i += 1;
+    }
+}
+
+func create_process(name: *u8) -> u32 {
+    var i: u32 = 0;
+    while (i < MAX_PROCESSES) {
+        var state: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state == STATE_FREE) {
+            # Copy name
+            var name_offset: u32 = i * 16;
+            var name_dst: *u8 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(name_dst) : "r"(PROC_NAMES), "r"(name_offset));
+            _process_copy_name(name_dst, name);
+            
+            # Set PID
+            var pid = next_pid;
+            next_pid += 1;
+            var pid_offset = i * 4;
+            asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t" : : "r"(PROC_PIDS), "r"(pid_offset), "r"(pid) : "%eax");
+            
+            # Set state to running
+            var running = STATE_RUNNING;
+            asm("movb %b2, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(i), "q"(running));
+            
+            # 1 main thread
+            var one_thread: u32 = 1;
+            asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t" : : "r"(PROC_THREADS), "r"(pid_offset), "r"(one_thread) : "%eax");
+            
+            return pid;
+        }
+        i += 1;
+    }
+    return 0; # Out of process slots
+}
+
+func init_processes() {
+    var i: u32 = 0;
+    while (i < MAX_PROCESSES) {
+        asm("movb $0, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(i));
+        i += 1;
+    }
+    
+    # Create the shell process as PID 1
+    create_process("shell");
+}
+
+func get_pid_index(pid: u32) -> u32 {
+    var i: u32 = 0;
+    while (i < MAX_PROCESSES) {
+        var state: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state != STATE_FREE) {
+            var curr_pid: u32 = 0;
+            var pid_offset = i * 4;
+            asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(curr_pid) : "r"(PROC_PIDS), "r"(pid_offset) : "%eax");
+            if (curr_pid == pid) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return MAX_PROCESSES;
+}
+
+func kill_process(pid: u32) -> u8 {
+    if (pid == 1) { return 0; } # Don't kill init/shell
+    var idx = get_pid_index(pid);
+    if (idx == MAX_PROCESSES) { return 0; }
+    
+    # Set state to FREE
+    var free_state = STATE_FREE;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(PROC_STATES), "r"(idx), "q"(free_state));
+    return 1;
+}
+
+func print_ps() {
+    io::print("PID  STATE    THREADS  COMMAND\n");
+    var i: u32 = 0;
+    while (i < MAX_PROCESSES) {
+        var state: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        if (state != STATE_FREE) {
+            var curr_pid: u32 = 0;
+            var pid_offset = i * 4;
+            asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(curr_pid) : "r"(PROC_PIDS), "r"(pid_offset) : "%eax");
+            
+            var threads: u32 = 0;
+            asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t" : "=r"(threads) : "r"(PROC_THREADS), "r"(pid_offset) : "%eax");
+            
+            var name_offset = i * 16;
+            var name_ptr: *u8 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(name_ptr) : "r"(PROC_NAMES), "r"(name_offset));
+            
+            io::print_u32(curr_pid);
+            if (curr_pid < 10) { io::print("    "); } else { io::print("   "); }
+            
+            if (state == STATE_RUNNING) { io::print("RUNNING  "); }
+            else if (state == STATE_SLEEPING) { io::print("SLEEPING "); }
+            else if (state == STATE_STOPPED) { io::print("STOPPED  "); }
+            
+            io::print_u32(threads);
+            io::print("        ");
+            io::print(name_ptr);
+            io::print_char(10);
+        }
+        i += 1;
+    }
+}
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+# A basic cooperative round-robin scheduler stub.
+func schedule() {
+    var start_index = current_task_index;
+    var i = start_index + 1;
+    if (i >= MAX_PROCESSES) { i = 0; }
+    
+    while (i != start_index) {
+        var state: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(state) : "r"(PROC_STATES), "r"(i) : "%eax");
+        
+        if (state == STATE_RUNNING) {
+            # Switch to this task
+            current_task_index = i;
+            
+            # In a real preemptive kernel, we would swap context here (registers/stack).
+            # For now, it's just updating tracking variables.
+            return;
+        }
+        
+        i += 1;
+        if (i >= MAX_PROCESSES) { i = 0; }
+    }
+    # If no other task is running, continue current task
+}

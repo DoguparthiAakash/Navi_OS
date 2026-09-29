@@ -1,0 +1,188 @@
+@[no_std]
+import std::io;
+import fb;
+import font;
+
+# ─── gui.nux — Graphical Desktop UI (Window Manager + App Shells) ─────────────
+#
+# Desktop layout:
+#   [Taskbar] — top bar, 28px tall: OS logo + open apps + clock
+#   [Desktop] — the main area with a wallpaper background
+#   [Dock]    — bottom bar, 48px: shortcut icons
+#
+# Color palette: Catppuccin Mocha
+#   Base:     0x1E1E2E  (dark navy background)
+#   Mantle:   0x181825  (darker panels)
+#   Surface0: 0x313244  (elevated surfaces)
+#   Overlay0: 0x6C7086  (muted text)
+#   Text:     0xCDD6F4  (primary text)
+#   Blue:     0x89B4FA
+#   Green:    0xA6E3A1
+#   Red:      0xF38BA8
+#   Yellow:   0xF9E2AF
+#   Mauve:    0xCBA6F7
+
+var C_BASE:    u32 = 0x1E1E2E;
+var C_MANTLE:  u32 = 0x181825;
+var C_SURFACE: u32 = 0x313244;
+var C_OVERLAY: u32 = 0x6C7086;
+var C_TEXT:    u32 = 0xCDD6F4;
+var C_BLUE:    u32 = 0x89B4FA;
+var C_GREEN:   u32 = 0xA6E3A1;
+var C_RED:     u32 = 0xF38BA8;
+var C_YELLOW:  u32 = 0xF9E2AF;
+var C_MAUVE:   u32 = 0xCBA6F7;
+var C_WHITE:   u32 = 0xFFFFFF;
+
+# Desktop state
+var TASKBAR_H: u32 = 28;
+var DOCK_H:    u32 = 48;
+
+# ─── Draw top taskbar ──────────────────────────────────────────────────────────
+func gui_draw_taskbar() {
+    var w = fb::fb_get_width();
+
+    # Taskbar background
+    fb::fb_fill_rect(0, 0, w, TASKBAR_H, C_MANTLE);
+
+    # Bottom border
+    fb::fb_draw_hline(0, TASKBAR_H - 1, w, C_SURFACE);
+
+    # Logo text "Navi OS"
+    font::font_draw_string("Navi OS", 8, 6, C_MAUVE, C_MANTLE);
+
+    # Separator
+    fb::fb_draw_vline(80, 4, TASKBAR_H - 8, C_SURFACE);
+
+    # Date/time placeholder
+    font::font_draw_string("00:00  Mon 01 Jan", w - 144, 6, C_OVERLAY, C_MANTLE);
+}
+
+# ─── Draw bottom dock ──────────────────────────────────────────────────────────
+func gui_draw_dock() {
+    var w = fb::fb_get_width();
+    var h = fb::fb_get_height();
+    var dock_y: u32 = 0;
+    asm("movl %1, %0\n\t" "subl %2, %0\n\t" : "=r"(dock_y) : "r"(h), "r"(DOCK_H));
+
+    # Dock background
+    fb::fb_fill_rect(0, dock_y, w, DOCK_H, C_MANTLE);
+    fb::fb_draw_hline(0, dock_y, w, C_SURFACE);
+
+    # Dock icons (drawn as colored squares with labels)
+    var icons_x: u32 = 8;
+    var icon_size: u32 = 36;
+    var icon_y: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $6, %0\n\t" : "=r"(icon_y) : "r"(dock_y));
+
+    # Terminal icon (blue)
+    fb::fb_fill_rect(icons_x,        icon_y, icon_size, icon_size, C_BLUE);
+    font::font_draw_string(">_", icons_x + 10, icon_y + 12, C_MANTLE, C_BLUE);
+
+    # Files icon (yellow)
+    fb::fb_fill_rect(icons_x + 44,   icon_y, icon_size, icon_size, C_YELLOW);
+    font::font_draw_string("FM", icons_x + 54, icon_y + 12, C_MANTLE, C_YELLOW);
+
+    # Notepad icon (green)
+    fb::fb_fill_rect(icons_x + 88,   icon_y, icon_size, icon_size, C_GREEN);
+    font::font_draw_string("NP", icons_x + 98, icon_y + 12, C_MANTLE, C_GREEN);
+
+    # Settings icon (mauve)
+    fb::fb_fill_rect(icons_x + 132,  icon_y, icon_size, icon_size, C_MAUVE);
+    font::font_draw_string("ST", icons_x + 142, icon_y + 12, C_MANTLE, C_MAUVE);
+}
+
+# ─── Draw wallpaper (gradient) ────────────────────────────────────────────────
+func gui_draw_wallpaper() {
+    var w = fb::fb_get_width();
+    var h = fb::fb_get_height();
+    var content_y = TASKBAR_H;
+    var content_h: u32 = 0;
+    asm("movl %1, %0\n\t" "subl %2, %0\n\t" "subl %3, %0\n\t"
+        : "=r"(content_h) : "r"(h), "r"(TASKBAR_H), "r"(DOCK_H));
+
+    # Simple vertical gradient from C_BASE to a slightly lighter shade
+    var row: u32 = 0;
+    while (row < content_h) {
+        # Blend factor: 0..255 as row goes top to bottom
+        var blend: u32 = (row * 40) / content_h;
+        # Base color 0x1E1E2E — add blend to each channel slightly
+        var r: u32 = 0x1E + blend;
+        var g: u32 = 0x1E + blend;
+        var b: u32 = 0x2E + (blend * 2);
+        if (r > 0xFF) { r = 0xFF; }
+        if (g > 0xFF) { g = 0xFF; }
+        if (b > 0xFF) { b = 0xFF; }
+        var color: u32 = 0;
+        asm("movl %1, %0\n\t" "shll $16, %0\n\t" "orl %2, %0\n\t" "shll $8, %0\n\t" "orl %3, %0\n\t"
+            : "=r"(color) : "r"(r), "r"(g), "r"(b));
+
+        fb::fb_draw_hline(0, content_y + row, w, color);
+        row += 1;
+    }
+}
+
+# ─── Draw a window frame ───────────────────────────────────────────────────────
+func gui_draw_window(x: u32, y: u32, w: u32, h: u32, title: *u8) {
+    # Window body
+    fb::fb_fill_rect(x, y, w, h, C_BASE);
+
+    # Title bar
+    fb::fb_fill_rect(x, y, w, 24, C_SURFACE);
+
+    # Title bar border
+    fb::fb_draw_hline(x, y + 24, w, C_OVERLAY);
+
+    # Window border
+    fb::fb_draw_rect(x, y, w, h, C_SURFACE);
+
+    # Title text
+    font::font_draw_string(title, x + 8, y + 4, C_TEXT, C_SURFACE);
+
+    # Close button (red dot at top-right)
+    fb::fb_fill_rect(x + w - 18, y + 6, 12, 12, C_RED);
+}
+
+# ─── Draw Terminal window ──────────────────────────────────────────────────────
+func gui_draw_terminal() {
+    var w = fb::fb_get_width();
+    var h = fb::fb_get_height();
+
+    var win_x: u32 = 40;
+    var win_y: u32 = 40;
+    var win_w: u32 = 0;
+    var win_h: u32 = 0;
+    asm("movl %1, %0\n\t" "subl $80, %0\n\t"  : "=r"(win_w) : "r"(w));
+    asm("movl %1, %0\n\t" "subl $120, %0\n\t" : "=r"(win_h) : "r"(h));
+
+    gui_draw_window(win_x, win_y, win_w, win_h, "Terminal — Navi OS");
+
+    # Terminal content area background
+    fb::fb_fill_rect(win_x + 1, win_y + 25, win_w - 2, win_h - 26, C_MANTLE);
+
+    # Draw some fake terminal lines
+    font::font_draw_string("Welcome to Navi OS v1.0", win_x + 8, win_y + 32, C_GREEN, C_MANTLE);
+    font::font_draw_string("Type 'help' for commands.", win_x + 8, win_y + 50, C_TEXT, C_MANTLE);
+    font::font_draw_string("root@navi:/> _", win_x + 8, win_y + 76, C_BLUE, C_MANTLE);
+}
+
+# ─── Full desktop render ───────────────────────────────────────────────────────
+func gui_render_desktop() {
+    if (fb::fb_is_active() == 0) {
+        io::print("[GUI] No framebuffer available. Run in VBE mode.\n");
+        io::print("[GUI] Add 'set gfxmode 1024x768x32' to grub.cfg and rebuild.\n");
+        return;
+    }
+
+    fb::fb_clear(C_BASE);
+    gui_draw_wallpaper();
+    gui_draw_taskbar();
+    gui_draw_dock();
+    gui_draw_terminal();
+}
+
+# ─── Initialize GUI subsystem ─────────────────────────────────────────────────
+func init_gui() {
+    font::init_font();
+    io::print("[GUI] Font engine initialized.\n");
+}

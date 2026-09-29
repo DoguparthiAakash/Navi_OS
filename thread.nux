@@ -1,0 +1,206 @@
+@[no_std]
+import std::io;
+
+# ─── thread.nux — Thread Management ──────────────────────────────────────────
+#
+# Each thread has its own saved CPU context (registers) so the scheduler
+# can pause one thread and resume another (preemptive multitasking).
+#
+# Thread context layout (saved at THREAD_STACK_BASE + tid * THREAD_CONTEXT_SIZE):
+#   +0:  eax   +4:  ebx   +8:  ecx   +12: edx
+#   +16: esi   +20: edi   +24: ebp   +28: esp (stack pointer)
+#   +32: eip   (instruction pointer = where to resume)
+#   +36: eflags
+#   +40: state (0=free, 1=ready, 2=running, 3=blocked)
+#   +44: owner_pid
+#   +48: stack_top (the top of this thread's private stack)
+#
+# Thread stacks are at 0x01600000, each 16 KB apart:
+#   Thread 0: 0x01600000 - 0x01603FFF
+#   Thread 1: 0x01604000 - 0x01607FFF
+#   ...
+
+var MAX_THREADS:        u32 = 64;
+var THREAD_CTX_BASE:   *u8 = 0x01500000;   # 64 * 52 = 3328 bytes for contexts
+var THREAD_STACK_BASE: u32 = 0x01600000;   # Thread stacks start here
+var THREAD_STACK_SIZE: u32 = 0x4000;       # 16 KB per thread
+var THREAD_CTX_SIZE:   u32 = 52;           # bytes per context
+
+# Context field offsets
+var CTX_EAX:    u32 = 0;
+var CTX_EBX:    u32 = 4;
+var CTX_ECX:    u32 = 8;
+var CTX_EDX:    u32 = 12;
+var CTX_ESI:    u32 = 16;
+var CTX_EDI:    u32 = 20;
+var CTX_EBP:    u32 = 24;
+var CTX_ESP:    u32 = 28;
+var CTX_EIP:    u32 = 32;
+var CTX_EFLAGS: u32 = 36;
+var CTX_STATE:  u32 = 40;
+var CTX_OWNER:  u32 = 44;
+var CTX_STKTOP: u32 = 48;
+
+# Thread states
+var TSTATE_FREE:    u8 = 0;
+var TSTATE_READY:   u8 = 1;
+var TSTATE_RUNNING: u8 = 2;
+var TSTATE_BLOCKED: u8 = 3;
+
+# Currently running thread index
+var current_thread: u32 = 0;
+var next_tid:       u32 = 1;
+
+# ─── Helpers to read/write context fields ─────────────────────────────────────
+func _thread_write_u32(tid: u32, field_offset: u32, value: u32) {
+    var ctx_offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movl %2, (%%eax)\n\t"
+        : : "r"(THREAD_CTX_BASE), "r"(ctx_offset), "r"(value) : "%eax");
+}
+
+func _thread_read_u32(tid: u32, field_offset: u32) -> u32 {
+    var ctx_offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    var val: u32 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movl (%%eax), %0\n\t"
+        : "=r"(val) : "r"(THREAD_CTX_BASE), "r"(ctx_offset) : "%eax");
+    return val;
+}
+
+func _thread_write_u8(tid: u32, field_offset: u32, value: u8) {
+    var ctx_offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    asm("movl %0, %%eax\n\t" "addl %1, %%eax\n\t" "movb %b2, (%%eax)\n\t"
+        : : "r"(THREAD_CTX_BASE), "r"(ctx_offset), "q"(value) : "%eax");
+}
+
+func _thread_read_u8(tid: u32, field_offset: u32) -> u8 {
+    var ctx_offset: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(ctx_offset) : "r"(tid), "r"(THREAD_CTX_SIZE), "r"(field_offset));
+    var val: u8 = 0;
+    asm("movl %1, %%eax\n\t" "addl %2, %%eax\n\t" "movzbl (%%eax), %%ecx\n\t" "movb %%cl, %b0\n\t"
+        : "=q"(val) : "r"(THREAD_CTX_BASE), "r"(ctx_offset) : "%eax", "%ecx");
+    return val;
+}
+
+# ─── Initialize the thread table ──────────────────────────────────────────────
+func init_threads() {
+    var i: u32 = 0;
+    while (i < MAX_THREADS) {
+        _thread_write_u8(i, CTX_STATE, TSTATE_FREE);
+        _thread_write_u32(i, CTX_OWNER, 0);
+        i += 1;
+    }
+    # Mark thread 0 as the kernel/shell thread (already running)
+    _thread_write_u8(0, CTX_STATE, TSTATE_RUNNING);
+    _thread_write_u32(0, CTX_OWNER, 1);  # PID 1 (shell)
+}
+
+# ─── Create a new thread for a process ────────────────────────────────────────
+# entry_point: the function address to start executing
+# owner_pid:   the process that owns this thread
+# Returns the tid, or MAX_THREADS on failure.
+func create_thread(entry_point: u32, owner_pid: u32) -> u32 {
+    var i: u32 = 1;  # Skip tid 0 (kernel thread)
+    while (i < MAX_THREADS) {
+        var state = _thread_read_u8(i, CTX_STATE);
+        if (state == TSTATE_FREE) {
+            # Set up the thread's private stack
+            var stack_top: u32 = 0;
+            asm("movl %1, %0\n\t" "movl %2, %%eax\n\t" "imull %3, %%eax\n\t" "addl %%eax, %0\n\t"
+                : "=r"(stack_top) : "r"(THREAD_STACK_BASE), "r"(i), "r"(THREAD_STACK_SIZE) : "%eax");
+
+            _thread_write_u32(i, CTX_EIP,    entry_point);
+            _thread_write_u32(i, CTX_ESP,    stack_top);
+            _thread_write_u32(i, CTX_EBP,    stack_top);
+            _thread_write_u32(i, CTX_EFLAGS, 0x200);       # IF=1 (interrupts enabled)
+            _thread_write_u32(i, CTX_OWNER,  owner_pid);
+            _thread_write_u32(i, CTX_STKTOP, stack_top);
+            _thread_write_u8(i,  CTX_STATE,  TSTATE_READY);
+
+            return i;
+        }
+        i += 1;
+    }
+    return MAX_THREADS; # No free slot
+}
+
+# ─── Kill a thread ────────────────────────────────────────────────────────────
+func kill_thread(tid: u32) -> u8 {
+    if (tid == 0) { return 0; } # Never kill kernel thread
+    var state = _thread_read_u8(tid, CTX_STATE);
+    if (state == TSTATE_FREE) { return 0; }
+    _thread_write_u8(tid, CTX_STATE, TSTATE_FREE);
+    return 1;
+}
+
+# ─── Block/Unblock a thread ───────────────────────────────────────────────────
+func block_thread(tid: u32) {
+    _thread_write_u8(tid, CTX_STATE, TSTATE_BLOCKED);
+}
+
+func unblock_thread(tid: u32) {
+    var state = _thread_read_u8(tid, CTX_STATE);
+    if (state == TSTATE_BLOCKED) {
+        _thread_write_u8(tid, CTX_STATE, TSTATE_READY);
+    }
+}
+
+# ─── Print thread list ────────────────────────────────────────────────────────
+func print_threads() {
+    io::print("TID  PID  STATE    STACK_TOP\n");
+    var i: u32 = 0;
+    while (i < MAX_THREADS) {
+        var state = _thread_read_u8(i, CTX_STATE);
+        if (state != TSTATE_FREE) {
+            var owner = _thread_read_u32(i, CTX_OWNER);
+            var stktop = _thread_read_u32(i, CTX_STKTOP);
+            io::print_u32(i);
+            io::print("    ");
+            io::print_u32(owner);
+            io::print("    ");
+            if (state == TSTATE_READY)   { io::print("READY   "); }
+            if (state == TSTATE_RUNNING) { io::print("RUNNING "); }
+            if (state == TSTATE_BLOCKED) { io::print("BLOCKED "); }
+            io::print("0x");
+            io::print_u32(stktop);
+            io::print_char(10);
+        }
+        i += 1;
+    }
+}
+
+# ─── Preemptive Round-Robin Scheduler ─────────────────────────────────────────
+# Called from the PIT IRQ0 handler tick.
+# Saves current context, finds next READY thread, restores its context.
+# NOTE: Full context save/restore requires inline asm at the interrupt handler.
+#       This is the high-level scheduler logic that selects the next thread.
+func schedule_next() -> u32 {
+    var start = current_thread;
+    var i = current_thread + 1;
+    if (i >= MAX_THREADS) { i = 0; }
+
+    while (i != start) {
+        var state = _thread_read_u8(i, CTX_STATE);
+        if (state == TSTATE_READY || state == TSTATE_RUNNING) {
+            # Mark old thread as READY (if it was RUNNING)
+            var old_state = _thread_read_u8(current_thread, CTX_STATE);
+            if (old_state == TSTATE_RUNNING) {
+                _thread_write_u8(current_thread, CTX_STATE, TSTATE_READY);
+            }
+            # Switch to new thread
+            _thread_write_u8(i, CTX_STATE, TSTATE_RUNNING);
+            current_thread = i;
+            return i;
+        }
+        i += 1;
+        if (i >= MAX_THREADS) { i = 0; }
+    }
+    # No other thread found — stay on current
+    return current_thread;
+}

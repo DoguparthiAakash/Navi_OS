@@ -8,6 +8,13 @@ import keyboard;
 import ramfs;
 import edit;
 import fm;
+import process;
+import memory;
+import desktop;
+import image_viewer;
+import thread;
+import vfs;
+import pit;
 
 # ─── shell.nux — Navi OS Interactive Shell ────────────────────────────────────
 #
@@ -39,10 +46,28 @@ import fm;
 #   tail <file>   Print last 10 lines of file
 #   wc <file>     Print newline, word, and byte counts
 #   sleep <ms>    Halt CPU for rough duration
+#   ps            List processes
+#   kill <pid>    Kill a process
+#   bg <cmd>      Start process in background
+#   fg <pid>      Bring process to foreground
+#   jobs          List background jobs
+#   free          Show memory usage
+#   cc <file>     Compile and run a C/C++ file (LLVM stub)
+#   desktop       Switch to Graphical Desktop Mode
+#   view <file>   Open Photo Viewer
+#   threads       List all threads
+#   vfs-ls        List VFS root directory
+#   vfs-tree      Show full VFS directory tree
+#   uptime        Show ticks since boot
+#   cd <dir>      Change directory
 #   halt          Halt the CPU
 
 var CMD_BUF:  *u8 = 0x00200000;    # 64 KB command buffer
 var CMD_MAX:  u32 = 511;
+
+var DIR_BUF:  *u8 = 0x00210000;    # Buffer for current directory string
+var current_dir: *u8 = "/";
+
 
 func _shell_putch(buf: *u8, idx: u32, ch: u8) {
     asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buf), "r"(idx), "q"(ch));
@@ -88,7 +113,7 @@ func _read_line() -> u32 {
         # ── Ctrl+C: interrupt / clear line ────────────────────────────────
         if (ascii == 3) {  # Ctrl+C = ASCII ETX
             io::print("^C\n");
-            io::print("root@navi:~# ");
+            io::print("root@navi:~> ");
             idx = 0;
             continue;
         }
@@ -96,7 +121,7 @@ func _read_line() -> u32 {
         # ── Ctrl+L: clear screen ───────────────────────────────────────────
         if (ascii == 12) {  # Ctrl+L = ASCII FF
             io::clear();
-            io::print("root@navi:~# ");
+            io::print("root@navi:~> ");
             # Reprint what was typed so far
             var j: u32 = 0;
             while (j < idx) {
@@ -324,6 +349,86 @@ func _cmd_wc(fname: *u8) {
     io::print(" "); io::print(fname); io::print("\n");
 }
 
+func _parse_int(s: *u8) -> u32 {
+    var res: u32 = 0;
+    var i: u32 = 0;
+    while (true) {
+        var c: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(s), "r"(i) : "%eax");
+        if (c < 48 || c > 57) { break; }
+        res = (res * 10) + (c - 48);
+        i += 1;
+    }
+    return res;
+}
+
+func _cmd_kill(args: *u8) {
+    var pid = _parse_int(args);
+    if (pid == 0) {
+        io::print("kill: invalid pid\n");
+        return;
+    }
+    if (pid == 1) {
+        io::print("kill: cannot kill init/shell process\n");
+        return;
+    }
+    var ok = process::kill_process(pid);
+    if (ok == 1) {
+        io::print("Process killed.\n");
+    } else {
+        io::print("kill: no such process\n");
+    }
+}
+
+func _cmd_bg(args: *u8) {
+    var pid = process::create_process(args);
+    if (pid != 0) {
+        io::print("["); io::print_u32(pid); io::print("] ");
+        io::print(args);
+        io::print("\n");
+    } else {
+        io::print("bg: cannot create process (max limit reached)\n");
+    }
+}
+
+func _cmd_fg(args: *u8) {
+    var pid = _parse_int(args);
+    if (pid == 0) { io::print("fg: invalid pid\n"); return; }
+    # Dummy implementation for now, just pretend to resume it
+    io::print("Resumed process ");
+    io::print_u32(pid);
+    io::print(" in foreground.\n");
+}
+
+func _cmd_cd(args: *u8) {
+    # Since ramfs is flat right now, just pretend to change directory
+    if (string::eq(args, "/") || string::eq(args, "..")) {
+        current_dir = "/";
+    } else {
+        # Copy to DIR_BUF so it isn't overwritten by CMD_BUF
+        var i: u32 = 0;
+        while (true) {
+            var c: u8 = 0;
+            asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(args), "r"(i) : "%eax");
+            asm("movb %b2, (%0,%1,1)\n\t" : : "r"(DIR_BUF), "r"(i), "q"(c));
+            if (c == 0) { break; }
+            i += 1;
+        }
+        current_dir = DIR_BUF;
+    }
+}
+
+func _cmd_cc(args: *u8) {
+    io::set_color(io::COLOR_LIGHT_CYAN, io::COLOR_BLACK);
+    io::print("LLVM JIT Compiler & Executor (Stub)\n");
+    io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+    io::print("Analyzing source: ");
+    io::print(args);
+    io::print("\n");
+    io::print("Error: LLVM backend and standard library not yet ported to Nux!\n");
+    io::print("To implement fully in Nux, we must bootstrap a native Nux IR compiler.\n");
+}
+
 func _cmd_help() {
     io::set_color(io::COLOR_LIGHT_CYAN, io::COLOR_BLACK);
     io::print("Navi OS — Available Commands\n");
@@ -347,6 +452,16 @@ func _cmd_help() {
     io::print("  wc <file>      Count words/lines\n");
     io::print("  edit <file>    Open Nux Editor (F1=Nano F2=Vim)\n");
     io::print("  fm             Open Nux File Manager\n");
+    io::print("  ps             List running processes\n");
+    io::print("  kill <pid>     Kill a process by PID\n");
+    io::print("  bg <cmd>       Run command as background job\n");
+    io::print("  fg <pid>       Bring job to foreground\n");
+    io::print("  jobs           List background jobs\n");
+    io::print("  free           Show memory usage\n");
+    io::print("  cc <file>      Compile/run C/C++ file (LLVM stub)\n");
+    io::print("  desktop        Start Graphical UI (Desktop Mode)\n");
+    io::print("  view <file>    Open image in Photo Viewer\n");
+    io::print("  cd <dir>       Change working directory\n");
     io::print("  sleep <ms>     Sleep (dummy loop)\n");
     io::print("  halt           Halt the system\n");
     io::set_color(io::COLOR_DARK_GREY, io::COLOR_BLACK);
@@ -368,7 +483,11 @@ func start_shell() {
 
     while (true) {
         io::set_color(io::COLOR_LIGHT_GREEN, io::COLOR_BLACK);
-        io::print("root@navi:~# ");
+        io::print("root@navi:");
+        io::set_color(io::COLOR_LIGHT_BLUE, io::COLOR_BLACK);
+        io::print(current_dir);
+        io::set_color(io::COLOR_LIGHT_GREEN, io::COLOR_BLACK);
+        io::print("> ");
         io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
 
         var len = _read_line();
@@ -381,7 +500,8 @@ func start_shell() {
         } else if (string::eq(CMD_BUF, "clear") || string::eq(CMD_BUF, "cls")) {
             io::clear();
         } else if (string::eq(CMD_BUF, "pwd")) {
-            io::print("/\n");
+            io::print(current_dir);
+            io::print_char(10);
         } else if (string::eq(CMD_BUF, "whoami")) {
             io::print("root\n");
         } else if (string::eq(CMD_BUF, "uname") || string::eq(CMD_BUF, "uname -a")) {
@@ -418,6 +538,37 @@ func start_shell() {
             _cmd_wc(CMD_BUF + 3);
         } else if (string::eq(CMD_BUF, "df")) {
             _cmd_df();
+        } else if (string::eq(CMD_BUF, "free")) {
+            io::print("Total RAM:   32 MB (Mocked)\n");
+            io::print("Heap Used:   ");
+            io::print_u32(memory::get_allocated_memory());
+            io::print(" bytes\n");
+        } else if (string::starts_with(CMD_BUF, "cc ")) {
+            _cmd_cc(CMD_BUF + 3);
+        } else if (string::eq(CMD_BUF, "ps") || string::eq(CMD_BUF, "jobs")) {
+            process::print_ps();
+        } else if (string::starts_with(CMD_BUF, "kill ")) {
+            _cmd_kill(CMD_BUF + 5);
+        } else if (string::starts_with(CMD_BUF, "bg ")) {
+            _cmd_bg(CMD_BUF + 3);
+        } else if (string::starts_with(CMD_BUF, "fg ")) {
+            _cmd_fg(CMD_BUF + 3);
+        } else if (string::starts_with(CMD_BUF, "cd ")) {
+            _cmd_cd(CMD_BUF + 3);
+        } else if (string::eq(CMD_BUF, "desktop")) {
+            desktop::start_desktop_mode();
+        } else if (string::starts_with(CMD_BUF, "view ")) {
+            image_viewer::open_image(CMD_BUF + 5);
+        } else if (string::eq(CMD_BUF, "threads")) {
+            thread::print_threads();
+        } else if (string::eq(CMD_BUF, "vfs-ls")) {
+            vfs::vfs_ls(0);
+        } else if (string::eq(CMD_BUF, "vfs-tree")) {
+            vfs::vfs_tree();
+        } else if (string::eq(CMD_BUF, "uptime")) {
+            io::print("Ticks since boot: ");
+            io::print_u32(pit::get_ticks());
+            io::print(" (100 Hz = 10ms/tick)\n");
         } else if (string::starts_with(CMD_BUF, "sleep ")) {
             # Dummy delay loop
             var k: u32 = 0;
