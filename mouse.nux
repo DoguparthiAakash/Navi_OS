@@ -1,0 +1,243 @@
+@[no_std]
+import std::hw;
+import std::io;
+import fb;
+
+# --- mouse.nux -- PS/2 Mouse Driver with IntelliMouse scroll wheel support ----
+#
+# Supports:
+#   - Standard PS/2 3-byte packets
+#   - IntelliMouse 4-byte packets (scroll wheel)
+#   - Left (bit0), Right (bit1), Middle (bit2) buttons
+#   - Scroll: mouse_scroll_dir = 0 (none), 1 (up), 2 (down)
+#
+# PS/2 Y axis convention:
+#   positive delta => mouse moved UP   => screen_y DECREASES
+#   negative delta => mouse moved DOWN => screen_y INCREASES
+#   (opposite of what you might expect — this is the hardware standard)
+
+var mouse_x:           u32 = 0;
+var mouse_y:           u32 = 0;
+var mouse_buttons:     u8  = 0;    # bit0=left, bit1=right, bit2=middle
+var mouse_scroll_dir:  u8  = 0;    # 0=none, 1=up, 2=down
+
+var _mouse_cycle:      u8  = 0;
+var _mouse_has_scroll: u8  = 0;    # 1 if IntelliMouse Z enabled
+var _mouse_packet:     *u8 = 0x00600000;  # 4-byte buffer at fixed physical addr
+
+# --- PS/2 controller helpers --------------------------------------------------
+func mouse_wait(a_type: u8) {
+    var timeout: u32 = 100000;
+    if (a_type == 0) {
+        while (timeout > 0) {
+            var status = hw::inb(0x64);
+            if ((status & 1) == 1) { return; }
+            timeout -= 1;
+        }
+    } else {
+        while (timeout > 0) {
+            var status = hw::inb(0x64);
+            if ((status & 2) == 0) { return; }
+            timeout -= 1;
+        }
+    }
+}
+
+func mouse_write(data: u8) {
+    mouse_wait(1);
+    hw::outb(0x64, 0xD4);
+    mouse_wait(1);
+    hw::outb(0x60, data);
+}
+
+func mouse_read() -> u8 {
+    mouse_wait(0);
+    return hw::inb(0x60);
+}
+
+# --- Initialization -----------------------------------------------------------
+func init_mouse() {
+    _mouse_cycle      = 0;
+    _mouse_has_scroll = 0;
+    mouse_scroll_dir  = 0;
+
+    # Start cursor at screen center
+    mouse_x = fb::fb_get_width()  / 2;
+    mouse_y = fb::fb_get_height() / 2;
+    if (mouse_x == 0) { mouse_x = 512; }
+    if (mouse_y == 0) { mouse_y = 384; }
+
+    # Enable auxiliary mouse device
+    mouse_wait(1);
+    hw::outb(0x64, 0xA8);
+
+    # Enable mouse interrupts in the PS/2 command byte
+    mouse_wait(1);
+    hw::outb(0x64, 0x20);
+    mouse_wait(0);
+    var status = hw::inb(0x60) | 2;
+    mouse_wait(1);
+    hw::outb(0x64, 0x60);
+    mouse_wait(1);
+    hw::outb(0x60, status);
+
+    # Use default settings
+    mouse_write(0xF6);
+    mouse_read();  # ACK
+
+    # --- Try to enable IntelliMouse scroll wheel ------------------------------
+    # Magic sequence: set sample rates 200 -> 100 -> 80, then query ID.
+    # If device replies with ID 0x03, 4-byte IntelliMouse packets are active.
+    var r: u8 = 200;
+    mouse_write(0xF3); mouse_read();
+    mouse_write(r);    mouse_read();
+
+    r = 100;
+    mouse_write(0xF3); mouse_read();
+    mouse_write(r);    mouse_read();
+
+    r = 80;
+    mouse_write(0xF3); mouse_read();
+    mouse_write(r);    mouse_read();
+
+    # Query device ID
+    mouse_write(0xF2);
+    mouse_read();  # ACK
+    var dev_id = mouse_read();
+
+    if (dev_id == 3) {
+        _mouse_has_scroll = 1;
+        io::print("Mouse: IntelliMouse (scroll wheel active)\n");
+    } else {
+        io::print("Mouse: Standard PS/2 (3-button)\n");
+    }
+
+    # Enable data reporting
+    mouse_write(0xF4);
+    mouse_read();  # ACK
+
+    io::print("PS/2 Mouse initialized.\n");
+}
+
+# --- Public getters -----------------------------------------------------------
+func get_mouse_x()          -> u32 { return mouse_x; }
+func get_mouse_y()          -> u32 { return mouse_y; }
+func get_mouse_buttons()    -> u8  { return mouse_buttons; }
+func get_mouse_scroll_dir() -> u8  { return mouse_scroll_dir; }
+
+func mouse_left_pressed()   -> u8  { return mouse_buttons & 1; }
+func mouse_right_pressed()  -> u8  { return (mouse_buttons >> 1) & 1; }
+func mouse_middle_pressed() -> u8  { return (mouse_buttons >> 2) & 1; }
+
+# --- Internal: decode a complete packet (defined FIRST so C sees it before use)
+func _decode_packet() -> u8 {
+    var ptr = _mouse_packet;
+    var b0: u8 = 0; var b1: u8 = 0; var b2: u8 = 0;
+    asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(b0) : "r"(ptr), "r"(0) : "%eax");
+    asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(b1) : "r"(ptr), "r"(1) : "%eax");
+    asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(b2) : "r"(ptr), "r"(2) : "%eax");
+
+    # Discard overflow packets (data is unreliable)
+    if ((b0 & 0xC0) != 0) { return 0; }
+
+    # Button state: bit0=left, bit1=right, bit2=middle
+    mouse_buttons = b0 & 0x07;
+
+    # --- X axis ---------------------------------------------------------------
+    # sign_x set (bit4 of b0) => dx is negative (moved left)
+    var sign_x: u8 = (b0 >> 4) & 1;
+    var dx: u32 = b1 as u32;
+
+    if (sign_x != 0) {
+        var mag_x: u32 = 0x100 - (dx & 0xFF);
+        if (mag_x < mouse_x) { mouse_x -= mag_x; } else { mouse_x = 0; }
+    } else {
+        if (dx > 0) { mouse_x += dx; }
+    }
+
+    # --- Y axis (INVERTED from screen coordinates) ----------------------------
+    # sign_y set (bit5 of b0) => dy is negative => mouse moved DOWN => screen_y++
+    # sign_y clear             => dy is positive => mouse moved UP   => screen_y--
+    var sign_y: u8 = (b0 >> 5) & 1;
+    var dy: u32 = b2 as u32;
+
+    if (sign_y != 0) {
+        # Negative PS/2 Y = down = increase screen Y
+        var mag_y: u32 = 0x100 - (dy & 0xFF);
+        var h: u32 = fb::fb_get_height();
+        mouse_y += mag_y;
+        if (mouse_y >= h) { mouse_y = h - 1; }
+    } else {
+        # Positive PS/2 Y = up = decrease screen Y
+        if (dy > 0) {
+            if (dy < mouse_y) { mouse_y -= dy; } else { mouse_y = 0; }
+        }
+    }
+
+    # Clamp X
+    var w: u32 = fb::fb_get_width();
+    if (mouse_x >= w) { mouse_x = w - 1; }
+
+    # --- Scroll wheel (4th byte) ----------------------------------------------
+    mouse_scroll_dir = 0;
+    if (_mouse_has_scroll != 0) {
+        var b3: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(b3) : "r"(ptr), "r"(3) : "%eax");
+        var z: u8 = b3 & 0x0F;
+        if (z != 0) {
+            if ((z & 0x08) != 0) {
+                # bit3 set => negative (two's complement nibble) => scroll DOWN
+                mouse_scroll_dir = 2;
+            } else {
+                # positive nibble => scroll UP
+                mouse_scroll_dir = 1;
+            }
+        }
+    }
+
+    return 1;
+}
+
+# --- Process one incoming PS/2 byte -------------------------------------------
+# Returns 1 when a complete packet is processed, 0 while accumulating.
+func handle_mouse_byte(b: u8) -> u8 {
+    # Byte 0: status byte — must have bit3 set (always-1), use as sync guard
+    if (_mouse_cycle == 0) {
+        if ((b & 0x08) == 0) { return 0; }   # Resync: not first byte
+        var ptr0 = _mouse_packet;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(ptr0), "r"(0), "q"(b));
+        _mouse_cycle = 1;
+        return 0;
+    }
+
+    # Byte 1: X delta
+    if (_mouse_cycle == 1) {
+        var ptr1 = _mouse_packet;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(ptr1), "r"(1), "q"(b));
+        _mouse_cycle = 2;
+        return 0;
+    }
+
+    # Byte 2: Y delta
+    if (_mouse_cycle == 2) {
+        var ptr2 = _mouse_packet;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(ptr2), "r"(2), "q"(b));
+        if (_mouse_has_scroll != 0) {
+            _mouse_cycle = 3;
+            return 0;
+        }
+        _mouse_cycle = 0;
+        return _decode_packet();
+    }
+
+    # Byte 3: Scroll wheel Z (IntelliMouse only)
+    if (_mouse_cycle == 3) {
+        var ptr3 = _mouse_packet;
+        asm("movb %b2, (%0,%1,1)\n\t" : : "r"(ptr3), "r"(3), "q"(b));
+        _mouse_cycle = 0;
+        return _decode_packet();
+    }
+
+    _mouse_cycle = 0;
+    return 0;
+}

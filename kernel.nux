@@ -14,10 +14,16 @@ import vfs;
 import fb;
 import font;
 import gui;
+import mouse;
+import keyboard;
+import syscall;
+import desktop;
 
-# The entry point called by boot.s
+# kmain is called from _start in boot.nux with two arguments pushed onto the stack:
+#   arg0 (mbi_ptr):   physical address of the Multiboot Info struct (from EBX)
+#   arg1 (mbi_magic): should be 0x2BADB002 (from EAX, pushed second so it's arg1)
 @[entry]
-func kmain() {
+func kmain(mbi_magic: u32, mbi_ptr: u32) {
     # 1. Memory and process management
     io::clear();
     memory::init_memory();
@@ -28,24 +34,29 @@ func kmain() {
 
     # 3. Hardware interrupt subsystem (PIC + PIT timer, no sti yet)
     pit::init_interrupts();
+    syscall::init_syscalls();
 
     # 4. Virtual File System
     vfs::init_vfs();
     vfs::vfs_populate_tree();
 
     # 5. Framebuffer / GUI
-    # Save the Multiboot info pointer (EBX from bootloader) so fb can read it.
-    # GRUB puts the MBI address in EBX; boot.nux passes it through kmain's arg.
-    # For now we pass 0 (text mode fallback) until we wire EBX through boot.nux.
-    fb::fb_save_mbi(0);
+    # Save the Multiboot info pointer GRUB passed in EBX.
+    # fb_read_mbi() will parse it for the VBE framebuffer address/pitch/size.
+    fb::fb_save_mbi(mbi_ptr);
     var fb_ok = fb::fb_read_mbi();
     if (fb_ok == 1) {
         gui::init_gui();
+        mouse::init_mouse();
         gui::gui_render_desktop();
+        # Sync keyboard module's cursor tracking to the actual starting mouse pos
+        keyboard::_last_mouse_x = mouse::get_mouse_x();
+        keyboard::_last_mouse_y = mouse::get_mouse_y();
+        # GUI event loop would go here in a full windowed OS.
+        # For now we fall through to the text shell.
     }
-
-    # 6. Hand off to interactive text shell
-    shell::start_shell();
+    # 6. Hand off to desktop mode (GUI)
+    desktop::start_desktop_mode();
 
     # Should never return
     hw::halt_forever();

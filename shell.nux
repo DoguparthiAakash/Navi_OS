@@ -10,7 +10,6 @@ import edit;
 import fm;
 import process;
 import memory;
-import desktop;
 import image_viewer;
 import thread;
 import vfs;
@@ -459,7 +458,6 @@ func _cmd_help() {
     io::print("  jobs           List background jobs\n");
     io::print("  free           Show memory usage\n");
     io::print("  cc <file>      Compile/run C/C++ file (LLVM stub)\n");
-    io::print("  desktop        Start Graphical UI (Desktop Mode)\n");
     io::print("  view <file>    Open image in Photo Viewer\n");
     io::print("  cd <dir>       Change working directory\n");
     io::print("  sleep <ms>     Sleep (dummy loop)\n");
@@ -495,7 +493,9 @@ func start_shell() {
         if (len == 0) { continue; }
 
         # ── Dispatch ───────────────────────────────────────────────────────
-        if (string::eq(CMD_BUF, "help")) {
+        if (string::eq(CMD_BUF, "exit")) {
+            return;
+        } else if (string::eq(CMD_BUF, "help")) {
             _cmd_help();
         } else if (string::eq(CMD_BUF, "clear") || string::eq(CMD_BUF, "cls")) {
             io::clear();
@@ -555,8 +555,6 @@ func start_shell() {
             _cmd_fg(CMD_BUF + 3);
         } else if (string::starts_with(CMD_BUF, "cd ")) {
             _cmd_cd(CMD_BUF + 3);
-        } else if (string::eq(CMD_BUF, "desktop")) {
-            desktop::start_desktop_mode();
         } else if (string::starts_with(CMD_BUF, "view ")) {
             image_viewer::open_image(CMD_BUF + 5);
         } else if (string::eq(CMD_BUF, "threads")) {

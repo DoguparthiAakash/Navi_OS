@@ -1,6 +1,9 @@
 @[no_std]
 
 import std::hw;
+import mouse;
+import gui;
+import gui_vga;
 
 # ─── keyboard.nux — Full PS/2 Keyboard Driver ─────────────────────────────────
 #
@@ -244,15 +247,34 @@ func init_keymaps() {
         : : "r"(sbase));
 }
 
+# ─── Saved mouse position for partial redraws ────────────────────────────────
+var _last_mouse_x: u32 = 0;
+var _last_mouse_y: u32 = 0;
+
 # ─── Read one scancode from the keyboard controller ───────────────────────────
 func _get_scancode() -> u8 {
+    gui_vga::gui_sync_vga();
     while (true) {
         var status = hw::inb(hw::KEYBOARD_STATUS_PORT);
         if ((status & 1) != 0) {
-            break;
+            if ((status & 0x20) != 0) {
+                # Mouse data — use fast partial redraw instead of full re-render
+                var ready = mouse::handle_mouse_byte(hw::inb(hw::KEYBOARD_DATA_PORT));
+                if (ready == 1) {
+                    var nx = mouse::get_mouse_x();
+                    var ny = mouse::get_mouse_y();
+                    if (gui_vga::gui_vga_is_active() != 0) { gui_vga::gui_sync_vga(); }
+                    gui::gui_update_mouse(_last_mouse_x, _last_mouse_y, nx, ny);
+                    _last_mouse_x = nx;
+                    _last_mouse_y = ny;
+                }
+            } else {
+                # Keyboard data
+                return hw::inb(hw::KEYBOARD_DATA_PORT);
+            }
         }
     }
-    return hw::inb(hw::KEYBOARD_DATA_PORT);
+    return 0;
 }
 
 # ─── Read a full key event ────────────────────────────────────────────────────

@@ -1,0 +1,72 @@
+@[no_std]
+import std::io;
+import thread;
+import pit;
+
+# ─── syscall.nux — System Call Interface ──────────────────────────────────────
+#
+# Implements INT 0x80 system call dispatching for application functionalities.
+# 
+# Syscall Numbers:
+#   1 = sys_puts(str)
+#   2 = sys_exit(code)
+#   3 = sys_yield()
+
+func syscall_dispatcher(num: u32, arg1: u32, arg2: u32, arg3: u32) -> u32 {
+    if (num == 1) {
+        # sys_puts
+        io::print(arg1 as *u8);
+        return 0;
+    }
+    if (num == 2) {
+        # sys_exit
+        io::print("App exited with code ");
+        io::print_u32(arg1);
+        io::print_char(10);
+        # In a real OS we'd kill the current thread here
+        return 0;
+    }
+    if (num == 3) {
+        # sys_yield
+        # thread::schedule_next(); (not implemented fully)
+        return 0;
+    }
+    
+    io::print("Unknown syscall: ");
+    io::print_u32(num);
+    io::print_char(10);
+    return 0xFFFFFFFF;
+}
+
+func init_syscalls() {
+    # _syscall_isr is defined in syscall_stub.s
+    var isr_addr: u32 = 0;
+    asm("movl $_syscall_isr, %0\n\t" : "=r"(isr_addr));
+    
+    # Register INT 0x80 in the IDT
+    pit::idt_set_gate(0x80, isr_addr);
+    io::print("System calls (INT 0x80) initialized.\n");
+}
+
+# ─── User-space wrapper functions ─────────────────────────────────────────────
+
+func puts(s: *u8) {
+    var s_addr = s as u32;
+    asm("movl $1, %%eax\n\t"
+        "movl %0, %%ebx\n\t"
+        "int $0x80\n\t"
+        : : "r"(s_addr) : "%eax", "%ebx");
+}
+
+func exit(code: u32) {
+    asm("movl $2, %%eax\n\t"
+        "movl %0, %%ebx\n\t"
+        "int $0x80\n\t"
+        : : "r"(code) : "%eax", "%ebx");
+}
+
+func yield() {
+    asm("movl $3, %%eax\n\t"
+        "int $0x80\n\t"
+        : : : "%eax");
+}

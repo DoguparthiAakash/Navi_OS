@@ -141,11 +141,12 @@ func fb_is_active()  -> u8 {
     return v;
 }
 
+var BACKBUFFER: *u8 = 0x01400000;
+
 # ─── Put a single pixel (32bpp) ───────────────────────────────────────────────
 func fb_put_pixel(x: u32, y: u32, color: u32) {
     if (fb_is_active() == 0) { return; }
     var pitch = fb_get_pitch();
-    var addr  = fb_get_addr();
 
     # pixel_offset = y * pitch + x * 4
     var row: u32 = 0;
@@ -154,9 +155,26 @@ func fb_put_pixel(x: u32, y: u32, color: u32) {
     asm("movl %1, %0\n\t" "shll $2, %0\n\t" : "=r"(col) : "r"(x));
     var pixel_addr: u32 = 0;
     asm("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t"
-        : "=r"(pixel_addr) : "r"(addr), "r"(row), "r"(col));
+        : "=r"(pixel_addr) : "r"(BACKBUFFER), "r"(row), "r"(col));
 
     asm("movl %1, (%0)\n\t" : : "r"(pixel_addr), "r"(color));
+}
+
+# ─── Swap Buffers (Copy Backbuffer to VRAM) ───────────────────────────────────
+func fb_swap_buffers() {
+    if (fb_is_active() == 0) { return; }
+    var h = fb_get_height();
+    var pitch = fb_get_pitch();
+    var fb_addr = fb_get_addr();
+    
+    var bytes = h * pitch;
+    var dwords = bytes >> 2;
+    
+    asm("cld\n\t"
+        "rep movsl\n\t"
+        : 
+        : "S"(BACKBUFFER), "D"(fb_addr), "c"(dwords)
+        : "memory");
 }
 
 # ─── Fill a rectangle ──────────────────────────────────────────────────────────
@@ -203,3 +221,126 @@ func fb_draw_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
     fb_draw_vline(x,         y, h, color);   # left
     fb_draw_vline(x + w - 1, y, h, color);   # right
 }
+
+# ─── Draw an ARGB image from memory ──────────────────────────────────────────
+# data_ptr points to: u32 width, u32 height, then width*height u32 ARGB pixels
+func fb_draw_image(px: u32, py: u32, data_ptr: u32) {
+    if (fb_is_active() == 0) { return; }
+    if (data_ptr == 0) { return; }
+
+    var w: u32 = 0;
+    var h: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(w) : "r"(data_ptr));
+    
+    var h_ptr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $4, %0\n\t" : "=r"(h_ptr) : "r"(data_ptr));
+    asm("movl (%1), %0\n\t" : "=r"(h) : "r"(h_ptr));
+
+    var pixel_ptr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $8, %0\n\t" : "=r"(pixel_ptr) : "r"(data_ptr));
+
+    var row: u32 = 0;
+    while (row < h) {
+        var col: u32 = 0;
+        while (col < w) {
+            var color: u32 = 0;
+            asm("movl (%1), %0\n\t" : "=r"(color) : "r"(pixel_ptr));
+            
+            # Simple alpha test (alpha > 128)
+            var alpha: u32 = 0;
+            asm("movl %1, %0\n\t" "shrl $24, %0\n\t" : "=r"(alpha) : "r"(color));
+            
+            if (alpha > 128) {
+                fb_put_pixel(px + col, py + row, color);
+            }
+            
+            col += 1;
+            pixel_ptr += 4;
+        }
+        row += 1;
+    }
+}
+
+# ─── VRAM Direct Drawing (for mouse cursor optimization) ──────────────────────
+func fb_put_pixel_vram(x: u32, y: u32, color: u32) {
+    if (fb_is_active() == 0) { return; }
+    var pitch = fb_get_pitch();
+    var vram = fb_get_addr();
+    var row: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(row) : "r"(y), "r"(pitch));
+    var col: u32 = 0;
+    asm("movl %1, %0\n\t" "shll $2, %0\n\t" : "=r"(col) : "r"(x));
+    var pixel_addr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(pixel_addr) : "r"(vram), "r"(row), "r"(col));
+    asm("movl %1, (%0)\n\t" : : "r"(pixel_addr), "r"(color));
+}
+
+func fb_draw_image_vram(px: u32, py: u32, data_ptr: u32) {
+    if (fb_is_active() == 0) { return; }
+    if (data_ptr == 0) { return; }
+    var w: u32 = 0;
+    var h: u32 = 0;
+    asm("movl (%1), %0\n\t" : "=r"(w) : "r"(data_ptr));
+    var h_ptr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $4, %0\n\t" : "=r"(h_ptr) : "r"(data_ptr));
+    asm("movl (%1), %0\n\t" : "=r"(h) : "r"(h_ptr));
+    var pixel_ptr: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $8, %0\n\t" : "=r"(pixel_ptr) : "r"(data_ptr));
+    var row: u32 = 0;
+    while (row < h) {
+        var col: u32 = 0;
+        while (col < w) {
+            var color: u32 = 0;
+            asm("movl (%1), %0\n\t" : "=r"(color) : "r"(pixel_ptr));
+            var alpha: u32 = 0;
+            asm("movl %1, %0\n\t" "shrl $24, %0\n\t" : "=r"(alpha) : "r"(color));
+            if (alpha > 128) {
+                fb_put_pixel_vram(px + col, py + row, color);
+            }
+            col += 1;
+            pixel_ptr += 4;
+        }
+        row += 1;
+    }
+}
+
+# ─── Restore rect from BACKBUFFER to VRAM ────────────────────────────────────
+func fb_restore_rect(x: u32, y: u32, w: u32, h: u32) {
+    if (fb_is_active() == 0) { return; }
+    var pitch = fb_get_pitch();
+    var vram = fb_get_addr();
+    var max_w = fb_get_width();
+    var max_h = fb_get_height();
+
+    var row: u32 = 0;
+    while (row < h) {
+        var cy = y + row;
+        if (cy >= max_h) { break; }
+
+        var offset_y: u32 = 0;
+        asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(offset_y) : "r"(cy), "r"(pitch));
+        var offset_x: u32 = 0;
+        asm("movl %1, %0\n\t" "shll $2, %0\n\t" : "=r"(offset_x) : "r"(x));
+
+        var src_ptr: u32 = 0;
+        asm("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t" : "=r"(src_ptr) : "r"(BACKBUFFER), "r"(offset_y), "r"(offset_x));
+        var dst_ptr: u32 = 0;
+        asm("movl %1, %0\n\t" "addl %2, %0\n\t" "addl %3, %0\n\t" : "=r"(dst_ptr) : "r"(vram), "r"(offset_y), "r"(offset_x));
+
+        var col: u32 = 0;
+        while (col < w) {
+            var cx = x + col;
+            if (cx >= max_w) { break; }
+            var pixel: u32 = 0;
+            asm("movl (%1), %0\n\t" : "=r"(pixel) : "r"(src_ptr));
+            asm("movl %1, (%0)\n\t" : : "r"(dst_ptr), "r"(pixel));
+            src_ptr += 4;
+            dst_ptr += 4;
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+

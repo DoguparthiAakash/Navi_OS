@@ -1,7 +1,5 @@
 @[no_std]
 import std::io;
-import desktop;
-
 # ─── image_viewer.nux — Photo Viewer App Stub ─────────────────────────────────
 #
 # A program to view images inside the shell / desktop mode, supporting:
@@ -20,12 +18,6 @@ func open_image(filepath: *u8) {
     io::print("Opening image: ");
     io::print(filepath);
     io::print("\n");
-    
-    if (desktop::desktop_active == 0) {
-        io::print("[ERROR]: Cannot display image in VGA Text Mode!\n");
-        io::print("Please switch to graphical Desktop Mode first.\n");
-        return;
-    }
     
     io::print("Controls: [+] Zoom In  [-] Zoom Out  [Arrow Keys] Pan Image\n");
     # Image decoding and framebuffer blitting logic would go here.

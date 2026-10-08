@@ -32,49 +32,20 @@ func _copy_font_byte(idx: u32, val: u8) {
 }
 
 func _load_minimal_font() {
-    # For each ASCII character, we populate very rough glyph shapes.
-    # Space (32) - all zeros (already zero from init)
-    # We won't embed all 96 glyphs here manually; instead we embed a
-    # procedural "box" glyph generator. A production kernel would load
-    # a real PSF font binary from the ramdisk.
-
-    # Generate simple "block" glyphs for letters (A-Z, a-z, 0-9):
-    # Row pattern: top border + sides only — readable as a filled rectangle
-    # Each char gets a unique pattern derived from its ASCII code
-    var ch: u32 = 32;
-    while (ch < 128) {
-        var base = ch * 16;
-        var i: u32 = 0;
-        while (i < 16) {
-            var byte_val: u8 = 0;
-            if (i == 0 || i == 15) {
-                # Full row (top/bottom border)
-                byte_val = 0xFF;
-            } else if (i == 1 || i == 14) {
-                # Near top/bottom
-                byte_val = 0x81;
-            } else {
-                # Middle rows - encode a bit of character identity
-                var row_pat: u32 = (ch & 0x3F) | 0x81;
-                if ((i & 1) == 0) { row_pat = 0x81 | ((ch >> 1) & 0x3C); }
-                byte_val = row_pat as u8;
-            }
-            var idx: u32 = 0;
-            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(base), "r"(i));
-            _copy_font_byte(idx, byte_val);
-            i += 1;
-        }
-        ch += 1;
-    }
-
-    # Special case: space (32) = all zeros
-    var sp: u32 = 0;
-    var space_base: u32 = 32 * 16;
-    while (sp < 16) {
-        var idx: u32 = 0;
-        asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(space_base), "r"(sp));
-        _copy_font_byte(idx, 0);
-        sp += 1;
+    # Copy from asset_font linked symbol
+    var src: *u8 = 0;
+    asm("movl $asset_font, %0\n\t" : "=r"(src));
+    
+    if (src == 0) { return; }
+    
+    var i: u32 = 0;
+    while (i < 4096) {
+        var val: u8 = 0;
+        asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t"
+            : "=q"(val) : "r"(src), "r"(i) : "%eax");
+        asm("movb %b2, (%0,%1,1)\n\t"
+            : : "r"(FONT_DATA), "r"(i), "q"(val));
+        i += 1;
     }
 
     FONT_LOADED = 1;

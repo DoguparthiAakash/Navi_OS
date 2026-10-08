@@ -1,0 +1,153 @@
+@[no_std]
+import std::hw;
+import fb;
+import font;
+
+# --- gui_vga.nux -- VGA Text Buffer → Framebuffer Bridge ----------------------
+#
+# When a text-mode app (shell, fm, editor) runs inside a GUI window, this
+# module reads the VGA text buffer at 0xB8000 and renders each changed cell
+# into the framebuffer at the window's pixel offset.
+#
+# Shadow buffer at 0x01930000 stores the last-rendered state so only changed
+# cells get redrawn (dirty-cell optimisation).
+#
+# Colour palette: Catppuccin Mocha — matches the desktop theme exactly.
+
+# ─── Catppuccin Mocha palette (32-bit 0xRRGGBB) ─────────────────────────────
+var VGA_C_BASE:    u32 = 0x1E1E2E;  # 0  – Black
+var VGA_C_BLUE:    u32 = 0x89B4FA;  # 1  – Blue
+var VGA_C_GREEN:   u32 = 0xA6E3A1;  # 2  – Green
+var VGA_C_TEAL:    u32 = 0x94E2D5;  # 3  – Cyan / Teal
+var VGA_C_RED:     u32 = 0xF38BA8;  # 4  – Red
+var VGA_C_MAUVE:   u32 = 0xCBA6F7;  # 5  – Magenta
+var VGA_C_YELLOW:  u32 = 0xF9E2AF;  # 6  – Brown / Yellow
+var VGA_C_LGREY:   u32 = 0xBAC2DE;  # 7  – Light Grey
+var VGA_C_DGREY:   u32 = 0x6C7086;  # 8  – Dark Grey
+var VGA_C_LBLUE:   u32 = 0x74C7EC;  # 9  – Light Blue
+var VGA_C_LGREEN:  u32 = 0xA6E3A1;  # 10 – Light Green
+var VGA_C_LCYAN:   u32 = 0x89DCEB;  # 11 – Light Cyan
+var VGA_C_LRED:    u32 = 0xF38BA8;  # 12 – Light Red
+var VGA_C_LMAUVE:  u32 = 0xCBA6F7;  # 13 – Light Magenta
+var VGA_C_LYELLOW: u32 = 0xF9E2AF;  # 14 – Yellow (bright)
+var VGA_C_TEXT:    u32 = 0xCDD6F4;  # 15 – White / Main text
+
+# ─── Module state ────────────────────────────────────────────────────────────
+var VGA_WIN_X:    u32 = 0;
+var VGA_WIN_Y:    u32 = 0;
+var VGA_ACTIVE:   u8  = 0;
+
+# ─── Map a 4-bit VGA colour index to its GUI colour ──────────────────────────
+func vga_color_to_gui(c: u8) -> u32 {
+    var idx: u8 = c & 0x0F;
+    if (idx ==  0) { return VGA_C_BASE; }
+    if (idx ==  1) { return VGA_C_BLUE; }
+    if (idx ==  2) { return VGA_C_GREEN; }
+    if (idx ==  3) { return VGA_C_TEAL; }
+    if (idx ==  4) { return VGA_C_RED; }
+    if (idx ==  5) { return VGA_C_MAUVE; }
+    if (idx ==  6) { return VGA_C_YELLOW; }
+    if (idx ==  7) { return VGA_C_LGREY; }
+    if (idx ==  8) { return VGA_C_DGREY; }
+    if (idx ==  9) { return VGA_C_LBLUE; }
+    if (idx == 10) { return VGA_C_LGREEN; }
+    if (idx == 11) { return VGA_C_LCYAN; }
+    if (idx == 12) { return VGA_C_LRED; }
+    if (idx == 13) { return VGA_C_LMAUVE; }
+    if (idx == 14) { return VGA_C_LYELLOW; }
+    return VGA_C_TEXT;
+}
+
+# ─── Start VGA emulation, anchored at a window's top-left ────────────────────
+func gui_vga_start(win_x: u32, win_y: u32) {
+    VGA_WIN_X  = win_x;
+    VGA_WIN_Y  = win_y;
+    VGA_ACTIVE = 1;
+
+    # Invalidate shadow buffer so first sync does a full redraw.
+    # We write 0xFF bytes (impossible VGA value) to every shadow cell.
+    var shd: u32 = 0x01930000;
+    var i:   u32 = 0;
+    while (i < 4000) {         # 80 cols x 25 rows x 2 bytes = 4000
+        asm("movb $0xFF, (%0,%1,1)\n\t" : : "r"(shd), "r"(i));
+        i += 1;
+    }
+}
+
+func gui_vga_stop() {
+    VGA_ACTIVE = 0;
+}
+
+func gui_vga_is_active() -> u8 {
+    return VGA_ACTIVE;
+}
+
+# ─── Sync changed VGA text cells to the framebuffer ──────────────────────────
+# Call this every time something may have printed text.
+# Returns 1 if any cell changed, 0 otherwise.
+func gui_sync_vga() -> u8 {
+    if (VGA_ACTIVE == 0) { return 0; }
+
+    # Text-mode content area starts 8 px inside window and 28 px below title.
+    var base_x: u32 = VGA_WIN_X + 8;
+    var base_y: u32 = VGA_WIN_Y + 28;
+
+    var vga_base: u32 = 0xB8000;
+    var shd_base: u32 = 0x01930000;
+
+    var changed: u8 = 0;
+    var row: u32 = 0;
+    while (row < 25) {
+        var col: u32 = 0;
+        while (col < 80) {
+            # Byte offset = row*160 + col*2  (done with Nux arithmetic)
+            var off: u32 = row * 160;
+            off += col * 2;
+
+            # Read VGA cell (character | attribute)
+            var ch:   u8 = 0;
+            var attr: u8 = 0;
+            asm("movb (%1,%2,1), %0\n\t" : "=r"(ch)   : "r"(vga_base), "r"(off));
+            var off1: u32 = off + 1;
+            asm("movb (%1,%2,1), %0\n\t" : "=r"(attr) : "r"(vga_base), "r"(off1));
+
+            # Read shadow cell
+            var sch:   u8 = 0;
+            var sattr: u8 = 0;
+            asm("movb (%1,%2,1), %0\n\t" : "=r"(sch)   : "r"(shd_base), "r"(off));
+            asm("movb (%1,%2,1), %0\n\t" : "=r"(sattr) : "r"(shd_base), "r"(off1));
+
+            if (ch != sch || attr != sattr) {
+                changed = 1;
+
+                # Update shadow
+                asm("movb %2, (%0,%1,1)\n\t" : : "r"(shd_base), "r"(off),  "q"(ch));
+                asm("movb %2, (%0,%1,1)\n\t" : : "r"(shd_base), "r"(off1), "q"(attr));
+
+                # Decode colours (pure Nux – no asm needed)
+                var fg_idx: u8 = attr & 0x0F;
+                var bg_idx: u8 = (attr >> 4) & 0x0F;
+                var fg: u32 = vga_color_to_gui(fg_idx);
+                var bg: u32 = vga_color_to_gui(bg_idx);
+
+                # Pixel coords for this cell (8x16 font)
+                var px: u32 = base_x + col * 8;
+                var py: u32 = base_y + row * 16;
+
+                # Fill background, then draw character
+                fb::fb_fill_rect(px, py, 8, 16, bg);
+                if (ch != 32 && ch != 0) {
+                    font::font_draw_char(ch, px, py, fg, bg);
+                }
+            }
+
+            col += 1;
+        }
+        row += 1;
+    }
+
+    if (changed != 0) {
+        fb::fb_swap_buffers();
+    }
+    return changed;
+}

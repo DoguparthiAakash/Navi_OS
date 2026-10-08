@@ -1,0 +1,134 @@
+@[no_std]
+import std::hw;
+
+# --- rtc.nux -- CMOS Real-Time Clock Driver -----------------------------------
+#
+# The BIOS stores the system clock in CMOS RAM, accessible via:
+#   I/O port 0x70: index register (select which CMOS register to read)
+#   I/O port 0x71: data register  (read the selected register)
+#
+# Registers (values are in BCD by default unless Status B bit2 is set):
+#   0x00 = Seconds    0x02 = Minutes    0x04 = Hours
+#   0x07 = Day        0x08 = Month      0x09 = Year (00-99)
+#   0x0A = Status A   (bit7 = update-in-progress flag)
+#   0x0B = Status B   (bit2 = binary mode, bit1 = 24hr mode)
+#
+# We always wait for update-not-in-progress before reading.
+
+# Cached RTC values (updated each call to rtc_read_time)
+var rtc_sec:  u8 = 0;
+var rtc_min:  u8 = 0;
+var rtc_hour: u8 = 0;
+var rtc_day:  u8 = 1;
+var rtc_mon:  u8 = 1;
+var rtc_year: u8 = 0;   # 2-digit year from CMOS
+var rtc_cent: u8 = 20;  # century (default 20 = year 20xx)
+var rtc_wday: u8 = 1;   # 1=Sunday ... 7=Saturday
+
+# Internal: read one CMOS register
+func _cmos_read(reg: u8) -> u8 {
+    hw::outb(0x70, reg);
+    return hw::inb(0x71);
+}
+
+# Internal: wait for CMOS update to complete (bit7 of Status A)
+func _rtc_wait_ready() {
+    var tries: u32 = 10000;
+    while (tries > 0) {
+        var status_a = _cmos_read(0x0A);
+        if ((status_a & 0x80) == 0) { return; }
+        tries -= 1;
+    }
+}
+
+# Internal: convert BCD to binary
+func _bcd2bin(v: u8) -> u8 {
+    var hi: u8 = (v >> 4) & 0x0F;
+    var lo: u8 = v & 0x0F;
+    # hi * 10 + lo  (done with repeated add to avoid needing a multiply)
+    var result: u8 = lo;
+    var i: u8 = 0;
+    while (i < hi) {
+        result += 10;
+        i += 1;
+    }
+    return result;
+}
+
+# --- Read current time/date from CMOS -----------------------------------------
+# Call this before using rtc_sec, rtc_min, etc.
+func rtc_read_time() {
+    _rtc_wait_ready();
+
+    var s1  = _cmos_read(0x00);
+    var mn1 = _cmos_read(0x02);
+    var h1  = _cmos_read(0x04);
+    var d1  = _cmos_read(0x07);
+    var mo1 = _cmos_read(0x08);
+    var y1  = _cmos_read(0x09);
+    var wd1 = _cmos_read(0x06);
+
+    # Read Status B to check BCD vs binary mode
+    var status_b = _cmos_read(0x0B);
+    var is_binary: u8 = (status_b >> 2) & 1;
+
+    if (is_binary == 0) {
+        # BCD mode (most BIOS default) — convert
+        rtc_sec  = _bcd2bin(s1);
+        rtc_min  = _bcd2bin(mn1);
+        rtc_hour = _bcd2bin(h1 & 0x7F);  # mask AM/PM bit
+        rtc_day  = _bcd2bin(d1);
+        rtc_mon  = _bcd2bin(mo1);
+        rtc_year = _bcd2bin(y1);
+        rtc_wday = wd1;
+    } else {
+        # Binary mode
+        rtc_sec  = s1;
+        rtc_min  = mn1;
+        rtc_hour = h1 & 0x7F;
+        rtc_day  = d1;
+        rtc_mon  = mo1;
+        rtc_year = y1;
+        rtc_wday = wd1;
+    }
+
+    # Try century register (0x32, available on most modern hardware)
+    var cent_raw = _cmos_read(0x32);
+    if (cent_raw != 0) {
+        if (is_binary == 0) {
+            rtc_cent = _bcd2bin(cent_raw);
+        } else {
+            rtc_cent = cent_raw;
+        }
+    } else {
+        rtc_cent = 20;  # default: 21st century
+    }
+}
+
+# --- Digit helpers (write a u8 value as 2 ASCII digits into a buffer) ---------
+# buf_ptr: pointer to a char array, offset: position to write the 2 chars
+func rtc_write_digits(val: u8, buf_ptr: *u8, offset: u32) {
+    var tens: u8 = 0;
+    var v = val;
+    while (v >= 10) {
+        v -= 10;
+        tens += 1;
+    }
+    var ones: u8 = v;
+    var c_tens: u8 = tens + 48;  # '0' = 48
+    var c_ones: u8 = ones + 48;
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buf_ptr), "r"(offset),       "q"(c_tens));
+    var off2: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $1, %0\n\t" : "=r"(off2) : "r"(offset));
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buf_ptr), "r"(off2), "q"(c_ones));
+}
+
+# --- Public getters -----------------------------------------------------------
+func rtc_get_sec()  -> u8 { return rtc_sec; }
+func rtc_get_min()  -> u8 { return rtc_min; }
+func rtc_get_hour() -> u8 { return rtc_hour; }
+func rtc_get_day()  -> u8 { return rtc_day; }
+func rtc_get_mon()  -> u8 { return rtc_mon; }
+func rtc_get_year() -> u8 { return rtc_year; }
+func rtc_get_cent() -> u8 { return rtc_cent; }
+func rtc_get_wday() -> u8 { return rtc_wday; }

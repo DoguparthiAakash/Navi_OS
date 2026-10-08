@@ -1,33 +1,363 @@
 @[no_std]
 import std::io;
+import std::hw;
+import fb;
+import font;
+import gui;
+import mouse;
+import keyboard;
+import gui_vga;
+import shell;
+import fm;
 
-# ─── desktop.nux — Graphical Desktop Interface Stub ───────────────────────────
+# --- desktop.nux -- Graphical Desktop Event Loop --------------------------------
 #
-# To achieve a true Desktop environment, the following must be implemented:
-# 1. Multiboot VBE initialization (FrameBuffer instead of VGA text mode)
-# 2. Pixel drawing routines (put_pixel, draw_rect, draw_line)
-# 3. Font rendering (bitmap fonts, e.g., PC Screen Font / PSF)
-# 4. A Window Manager (compositor, Z-order, clipping)
-# 5. Mouse driver (PS/2 or USB HID)
+# Mouse:
+#   Left click   - activate UI elements, close/dock buttons
+#   Right click  - context menu stub
+#   Middle click - reserved
+#   Scroll dir 1 - scroll up
+#   Scroll dir 2 - scroll down
+#
+# Keyboard shortcuts:
+#   ESC / Q      - exit desktop, return to text shell
+#   R / F5       - force full desktop refresh
+#   F1           - show keyboard shortcut help
+#   Space/Enter  - refresh desktop
 
 var desktop_active: u8 = 0;
 
+# Dock icon hit regions (must match gui_draw_dock offsets)
+var DOCK_ICON_TERM_X: u32 = 8;
+var DOCK_ICON_FILE_X: u32 = 72;
+var DOCK_ICON_SET_X:  u32 = 136;
+var DOCK_ICON_W:      u32 = 48;
+var DOCK_ICON_H:      u32 = 48;
+
 func init_desktop() {
-    # Currently a stub. In the future, this will switch from VGA to VBE Framebuffer.
-    io::print("Initializing Graphical Desktop Environment...\n");
-    io::print("Loading Display Server...\n");
-    io::print("Loading Window Manager...\n");
     desktop_active = 1;
 }
 
+# Compatibility shim used by older shell code
 func draw_window(title: *u8, x: u32, y: u32, w: u32, h: u32) {
-    # Stub for window drawing
+    gui::gui_draw_window(x, y, w, h, title);
 }
 
+# --- Rectangle hit test -------------------------------------------------------
+func _in_rect(mx: u32, my: u32, rx: u32, ry: u32, rw: u32, rh: u32) -> u8 {
+    if (mx < rx) { return 0; }
+    if (my < ry) { return 0; }
+    var rx2: u32 = 0;
+    asm("movl %1, %0\n\taddl %2, %0\n\t" : "=r"(rx2) : "r"(rx), "r"(rw));
+    var ry2: u32 = 0;
+    asm("movl %1, %0\n\taddl %2, %0\n\t" : "=r"(ry2) : "r"(ry), "r"(rh));
+    if (mx >= rx2) { return 0; }
+    if (my >= ry2) { return 0; }
+    return 1;
+}
+
+# --- Left click handler -------------------------------------------------------
+func _handle_left_click(mx: u32, my: u32) {
+    var scr_h = fb::fb_get_height();
+    var scr_w = fb::fb_get_width();
+
+    # Dock Y position
+    var dock_y: u32 = 0;
+    asm("movl %1, %0\n\tsubl $48, %0\n\t" : "=r"(dock_y) : "r"(scr_h));
+
+    # Dock: Terminal icon -> start shell
+    if (_in_rect(mx, my, DOCK_ICON_TERM_X, dock_y, DOCK_ICON_W, DOCK_ICON_H) == 1) {
+        gui::gui_draw_window(40, 40, 656, 444, "Terminal (VGA Emulation)");
+        gui_vga::gui_vga_start(40, 40);
+        io::clear();
+        shell::start_shell();
+        gui_vga::gui_vga_stop();
+        gui::gui_render_desktop();
+        return;
+    }
+    # Dock: File manager
+    if (_in_rect(mx, my, DOCK_ICON_FILE_X, dock_y, DOCK_ICON_W, DOCK_ICON_H) == 1) {
+        gui::gui_draw_window(80, 80, 656, 444, "File Manager (VGA Emulation)");
+        gui_vga::gui_vga_start(80, 80);
+        io::clear();
+        fm::filemanager_open();
+        gui_vga::gui_vga_stop();
+        gui::gui_render_desktop();
+        return;
+    }
+    # Dock: Settings (placeholder)
+    if (_in_rect(mx, my, DOCK_ICON_SET_X, dock_y, DOCK_ICON_W, DOCK_ICON_H) == 1) {
+        gui::gui_draw_window(120, 120, 656, 444, "Settings");
+        gui_vga::gui_vga_start(120, 120);
+        io::clear();
+        io::set_color(io::COLOR_YELLOW, io::COLOR_BLACK);
+        io::print("\n\n    System Settings\n\n    (Not yet implemented)\n\n    Press ESC to close.");
+        io::set_color(io::COLOR_WHITE, io::COLOR_BLACK);
+        while (true) {
+            var ev = keyboard::read_key();
+            var ch = keyboard::key_ascii(ev);
+            if (ch == 27 || keyboard::key_special(ev) == keyboard::KEY_ESC) { break; }
+        }
+        gui_vga::gui_vga_stop();
+        gui::gui_render_desktop();
+        return;
+    }
+
+    # Window close button: window starts at x=40, y=40, w=scr_w-80
+    # Close icon is at (win_x + win_w - 20, win_y + 4), 16x16
+    var win_w: u32 = 0;
+    asm("movl %1, %0\n\tsubl $80, %0\n\t" : "=r"(win_w) : "r"(scr_w));
+    # close_x = 40 + win_w - 20 = win_w + 20
+    var close_x: u32 = 0;
+    asm("movl %1, %0\n\taddl $20, %0\n\t" : "=r"(close_x) : "r"(win_w));
+    # title bar at y=40, buttons at y=44
+    if (_in_rect(mx, my, close_x, 44, 16, 16) == 1) {
+        desktop_active = 0;
+        return;
+    }
+}
+
+# --- Right click handler (context menu stub) ----------------------------------
+func _handle_right_click(mx: u32, my: u32) {
+    # Draw a minimal context menu at click location
+    var menu_w: u32 = 140;
+    var menu_h: u32 = 88;
+
+    # Clamp so menu stays on screen
+    var scr_w = fb::fb_get_width();
+    var scr_h = fb::fb_get_height();
+    var mx2 = mx;
+    var my2 = my;
+    var right_edge: u32 = 0;
+    asm("movl %1, %0\n\taddl %2, %0\n\t" : "=r"(right_edge) : "r"(mx), "r"(menu_w));
+    if (right_edge >= scr_w) {
+        asm("movl %1, %0\n\tsubl %2, %0\n\t" : "=r"(mx2) : "r"(scr_w), "r"(menu_w));
+    }
+    var bot_edge: u32 = 0;
+    asm("movl %1, %0\n\taddl %2, %0\n\t" : "=r"(bot_edge) : "r"(my), "r"(menu_h));
+    if (bot_edge >= scr_h) {
+        asm("movl %1, %0\n\tsubl %2, %0\n\t" : "=r"(my2) : "r"(scr_h), "r"(menu_h));
+    }
+
+    # Draw directly to VRAM (menu is temporary, not in backbuffer)
+    fb::fb_fill_rect(mx2, my2, menu_w, menu_h, 0x313244);
+    fb::fb_draw_rect(mx2, my2, menu_w, menu_h, 0x89B4FA);
+
+    var tx: u32 = 0;
+    asm("movl %1, %0\n\taddl $8, %0\n\t" : "=r"(tx) : "r"(mx2));
+    var ty: u32 = 0;
+    asm("movl %1, %0\n\taddl $8, %0\n\t" : "=r"(ty) : "r"(my2));
+
+    font::font_draw_string("Refresh",       tx, ty,       0xCDD6F4, 0x313244);
+    ty += 18;
+    font::font_draw_string("Open Terminal", tx, ty,       0xCDD6F4, 0x313244);
+    ty += 18;
+    font::font_draw_string("Properties",    tx, ty,       0x6C7086, 0x313244);
+    ty += 18;
+    fb::fb_draw_hline(mx2, ty, menu_w, 0x6C7086);
+    ty += 8;
+    font::font_draw_string("Close Menu",    tx, ty,       0xF38BA8, 0x313244);
+
+    fb::fb_swap_buffers();
+
+    # Wait for next click to dismiss the context menu
+    var dismissed: u8 = 0;
+    while (dismissed == 0) {
+        var st = hw::inb(0x64);
+        if ((st & 1) != 0) {
+            if ((st & 0x20) != 0) {
+                # Drain mouse byte — any click dismisses
+                var mb = hw::inb(0x60);
+                dismissed = 1;
+            } else {
+                # Any key dismisses too
+                hw::inb(0x60);
+                dismissed = 1;
+            }
+        }
+    }
+
+    # Re-render desktop to erase the menu
+    gui::gui_render_desktop();
+}
+
+# --- Show help overlay --------------------------------------------------------
+func _show_help_overlay() {
+    var scr_w = fb::fb_get_width();
+    var scr_h = fb::fb_get_height();
+
+    # Center a 320x220 panel
+    var ox: u32 = 0;
+    var oy: u32 = 0;
+    asm("movl %1, %0\n\tsubl $320, %0\n\tshrl $1, %0\n\t" : "=r"(ox) : "r"(scr_w));
+    asm("movl %1, %0\n\tsubl $220, %0\n\tshrl $1, %0\n\t" : "=r"(oy) : "r"(scr_h));
+
+    fb::fb_fill_rect(ox, oy, 320, 220, 0x181825);
+    fb::fb_draw_rect(ox, oy, 320, 220, 0x89B4FA);
+    gui::gui_draw_window(ox, oy, 320, 220, "Keyboard & Mouse Shortcuts");
+
+    var tx: u32 = 0;
+    asm("movl %1, %0\n\taddl $10, %0\n\t" : "=r"(tx) : "r"(ox));
+    var ty: u32 = 0;
+    asm("movl %1, %0\n\taddl $34, %0\n\t" : "=r"(ty) : "r"(oy));
+
+    font::font_draw_string("-- Keyboard --",    tx, ty, 0x89B4FA, 0x181825);
+    ty += 16;
+    font::font_draw_string("ESC / Q    Exit desktop", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("R / F5     Force refresh", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("F1         This help", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("Space/Enter  Refresh", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 20;
+    font::font_draw_string("-- Mouse --",       tx, ty, 0x89B4FA, 0x181825);
+    ty += 16;
+    font::font_draw_string("Left Click   Activate", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("Right Click  Context menu", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("Scroll Up    Scroll content up", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 14;
+    font::font_draw_string("Scroll Down  Scroll content down", tx, ty, 0xCDD6F4, 0x181825);
+    ty += 20;
+    font::font_draw_string("Press any key to dismiss", tx, ty, 0x6C7086, 0x181825);
+
+    fb::fb_swap_buffers();
+
+    # Wait for any keypress to dismiss
+    var done: u8 = 0;
+    while (done == 0) {
+        var st = hw::inb(0x64);
+        if ((st & 1) != 0) {
+            if ((st & 0x20) == 0) {
+                var sc = hw::inb(0x60);
+                if ((sc & 0x80) == 0) { done = 1; }  # key-down event
+            } else {
+                hw::inb(0x60);  # drain mouse byte
+            }
+        }
+    }
+
+    # Re-render after dismissing
+    gui::gui_render_desktop();
+}
+
+# --- Desktop Main Event Loop --------------------------------------------------
 func start_desktop_mode() {
+    if (fb::fb_is_active() == 0) {
+        io::print("[Desktop] No framebuffer detected.\n");
+        io::print("  Boot with: set gfxmode=1024x768x32 in grub.cfg\n");
+        return;
+    }
+
     init_desktop();
-    io::print("\n[ERROR]: Missing VESA/VBE Framebuffer Graphics Driver!\n");
-    io::print("Navi OS is currently running in VGA Text Mode (80x25 characters).\n");
-    io::print("To use the Desktop GUI, Mesa drivers and a linear framebuffer are required.\n");
-    desktop_active = 0;
+    gui::gui_render_desktop();
+
+    var last_mx:  u32 = mouse::get_mouse_x();
+    var last_my:  u32 = mouse::get_mouse_y();
+    var prev_btn: u8  = 0;
+    var ext_key:  u8  = 0;  # extended scancode prefix flag (0xE0)
+
+    while (desktop_active != 0) {
+        var status = hw::inb(0x64);
+        if ((status & 1) == 0) {
+            # Nothing ready — short idle to reduce busy-wait heat
+            var idle: u32 = 200;
+            while (idle > 0) { idle -= 1; }
+            continue;
+        }
+
+        if ((status & 0x20) != 0) {
+            # ---- Mouse byte -------------------------------------------------
+            var ready = mouse::handle_mouse_byte(hw::inb(0x60));
+            if (ready == 1) {
+                var nx = mouse::get_mouse_x();
+                var ny = mouse::get_mouse_y();
+
+                # Fast partial cursor redraw only if position changed
+                if (nx != last_mx || ny != last_my) {
+                    gui::gui_update_mouse(last_mx, last_my, nx, ny);
+                    last_mx = nx;
+                    last_my = ny;
+                }
+
+                var btn = mouse::get_mouse_buttons();
+
+                # Left click: rising edge detection
+                var left_now: u8 = btn & 1;
+                var left_was: u8 = prev_btn & 1;
+                if (left_now != 0 && left_was == 0) {
+                    _handle_left_click(nx, ny);
+                }
+
+                # Right click: rising edge detection
+                var right_now: u8 = (btn >> 1) & 1;
+                var right_was: u8 = (prev_btn >> 1) & 1;
+                if (right_now != 0 && right_was == 0) {
+                    _handle_right_click(nx, ny);
+                }
+
+                # Scroll wheel (0=none, 1=up, 2=down)
+                var scroll = mouse::get_mouse_scroll_dir();
+                if (scroll != 0) {
+                    # Placeholder: future terminal scrollback implementation
+                }
+
+                prev_btn = btn;
+            }
+
+        } else {
+            # ---- Keyboard scancode ------------------------------------------
+            var sc = hw::inb(0x60);
+
+            # Extended prefix (0xE0): set flag, consume next byte
+            if (sc == 0xE0) { ext_key = 1; continue; }
+
+            # Key release (bit7): clear ext flag, ignore
+            if ((sc & 0x80) != 0) { ext_key = 0; continue; }
+
+            if (ext_key != 0) {
+                ext_key = 0;
+                # Extended key codes (arrows, Win keys) — ignored in desktop
+                continue;
+            }
+
+            ext_key = 0;
+
+            # ESC (0x01) or Q (0x10): exit desktop
+            if (sc == 0x01 || sc == 0x10) {
+                desktop_active = 0;
+                continue;
+            }
+
+            # R (0x13) or F5 (0x3F): force full refresh
+            if (sc == 0x13 || sc == 0x3F) {
+                gui::gui_render_desktop();
+                last_mx = mouse::get_mouse_x();
+                last_my = mouse::get_mouse_y();
+                continue;
+            }
+
+            # Space (0x39) or Enter (0x1C): refresh
+            if (sc == 0x1C || sc == 0x39) {
+                gui::gui_render_desktop();
+                last_mx = mouse::get_mouse_x();
+                last_my = mouse::get_mouse_y();
+                continue;
+            }
+
+            # F1 (0x3B): help overlay
+            if (sc == 0x3B) {
+                _show_help_overlay();
+                last_mx = mouse::get_mouse_x();
+                last_my = mouse::get_mouse_y();
+                continue;
+            }
+        }
+    }
+
+    io::clear();
+    io::print("Returned to Navi OS shell.\n");
+    io::print("Type 'desktop' to re-enter GUI mode.\n");
 }

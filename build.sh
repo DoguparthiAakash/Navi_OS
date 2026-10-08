@@ -40,35 +40,46 @@ echo -e "${DIM}  ├─ ✦ Compiling boot.nux → boot.o${RESET}"
 
 echo -e "${DIM}  ├─ ✦ Compiling kernel → kernel_nux.o${RESET}"
 "$NUX_BIN" build-native \
-    fs.nux \
     ../Nux_Lang/lib/std/hw.nux \
     ../Nux_Lang/lib/std/mem.nux \
     ../Nux_Lang/lib/std/string.nux \
     ../Nux_Lang/lib/std/io.nux \
     ../Nux_Lang/lib/std/math.nux \
-    keyboard.nux \
-    ramfs.nux \
-    process.nux \
+    fs.nux \
+    fb.nux \
+    font.nux \
+    rtc.nux \
     memory.nux \
     disk.nux \
     pit.nux \
     thread.nux \
     vfs.nux \
-    fb.nux \
-    font.nux \
-    gui.nux \
-    desktop.nux \
+    process.nux \
     image_viewer.nux \
+    ramfs.nux \
+    syscall.nux \
+    mouse.nux \
+    gui_vga.nux \
+    gui.nux \
+    keyboard.nux \
     edit.nux \
     fm.nux \
     shell.nux \
+    desktop.nux \
     kernel.nux \
     --output kernel_nux.o
 
 
+
+echo -e "${DIM}  ├─ ✦ Compiling assets.s → assets.o${RESET}"
+as --32 -o assets.o assets.s
+
+echo -e "${DIM}  ├─ ✦ Compiling syscall_stub.s → syscall_stub.o${RESET}"
+as --32 -o syscall_stub.o syscall_stub.s
+
 # ─── Step 2: Link ─────────────────────────────────────────────────────────
 echo -e "${DIM}  ├─ · Linking Navi OS...${RESET}"
-ld -m elf_i386 -T linker.ld boot.o kernel_nux.o -o navi.bin -nostdlib
+ld -m elf_i386 -T linker.ld boot.o kernel_nux.o assets.o syscall_stub.o -o navi.bin -nostdlib
 
 # ─── Step 3: Verify Multiboot ─────────────────────────────────────────────
 echo -e "${DIM}  ├─ · Verifying Multiboot header...${RESET}"

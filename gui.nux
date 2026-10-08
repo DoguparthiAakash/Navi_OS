@@ -1,27 +1,14 @@
 @[no_std]
 import std::io;
+import std::hw;
 import fb;
 import font;
+import rtc;
+import ramfs;
 
-# ─── gui.nux — Graphical Desktop UI (Window Manager + App Shells) ─────────────
-#
-# Desktop layout:
-#   [Taskbar] — top bar, 28px tall: OS logo + open apps + clock
-#   [Desktop] — the main area with a wallpaper background
-#   [Dock]    — bottom bar, 48px: shortcut icons
+# --- gui.nux -- Graphical Desktop UI ------------------------------------------
 #
 # Color palette: Catppuccin Mocha
-#   Base:     0x1E1E2E  (dark navy background)
-#   Mantle:   0x181825  (darker panels)
-#   Surface0: 0x313244  (elevated surfaces)
-#   Overlay0: 0x6C7086  (muted text)
-#   Text:     0xCDD6F4  (primary text)
-#   Blue:     0x89B4FA
-#   Green:    0xA6E3A1
-#   Red:      0xF38BA8
-#   Yellow:   0xF9E2AF
-#   Mauve:    0xCBA6F7
-
 var C_BASE:    u32 = 0x1E1E2E;
 var C_MANTLE:  u32 = 0x181825;
 var C_SURFACE: u32 = 0x313244;
@@ -34,65 +21,174 @@ var C_YELLOW:  u32 = 0xF9E2AF;
 var C_MAUVE:   u32 = 0xCBA6F7;
 var C_WHITE:   u32 = 0xFFFFFF;
 
-# Desktop state
 var TASKBAR_H: u32 = 28;
 var DOCK_H:    u32 = 48;
 
-# ─── Draw top taskbar ──────────────────────────────────────────────────────────
+# Clock string buffer: "HH:MM:SS  DD Mon YYYY" + null = 22 bytes at fixed addr
+var _CLK_BUF:  *u8 = 0x01910000;
+
+# Month name table at fixed addr (3 chars + space per month = 4*12 = 48 bytes)
+var _MON_TBL:  *u8 = 0x01910040;
+var _MON_INIT: u8  = 0;
+
+# Day-of-week table (3 chars + null = 4*7 = 28 bytes)
+var _DOW_TBL:  *u8 = 0x01910080;
+
+# --- Asset loaders -----------------------------------------------------------
+func _get_cursor() -> u32 { var p: u32 = 0; asm("movl $asset_cursor, %0\n\t"       : "=r"(p)); return p; }
+func _get_close()  -> u32 { var p: u32 = 0; asm("movl $asset_icon_close, %0\n\t"   : "=r"(p)); return p; }
+func _get_min()    -> u32 { var p: u32 = 0; asm("movl $asset_icon_minimize, %0\n\t": "=r"(p)); return p; }
+func _get_max()    -> u32 { var p: u32 = 0; asm("movl $asset_icon_maximize, %0\n\t": "=r"(p)); return p; }
+func _get_term()   -> u32 { var p: u32 = 0; asm("movl $asset_icon_terminal, %0\n\t": "=r"(p)); return p; }
+func _get_file()   -> u32 { var p: u32 = 0; asm("movl $asset_icon_file, %0\n\t"    : "=r"(p)); return p; }
+func _get_set()    -> u32 { var p: u32 = 0; asm("movl $asset_icon_settings, %0\n\t": "=r"(p)); return p; }
+
+# --- Write a single byte to a buffer -----------------------------------------
+func _buf_putb(buf: *u8, idx: u32, c: u8) {
+    asm("movb %b2, (%0,%1,1)\n\t" : : "r"(buf), "r"(idx), "q"(c));
+}
+func _buf_getb(buf: *u8, idx: u32) -> u8 {
+    var c: u8 = 0;
+    asm("movzbl (%1,%2,1), %%eax\n\t" "movb %%al, %b0\n\t" : "=q"(c) : "r"(buf), "r"(idx) : "%eax");
+    return c;
+}
+
+# --- Write 3-char string into buffer at offset --------------------------------
+func _buf_puts3(buf: *u8, off: u32, a: u8, b: u8, c: u8) {
+    _buf_putb(buf, off,       a);
+    var o1: u32 = 0; asm("movl %1, %0\n\t" "addl $1, %0\n\t" : "=r"(o1) : "r"(off));
+    var o2: u32 = 0; asm("movl %1, %0\n\t" "addl $2, %0\n\t" : "=r"(o2) : "r"(off));
+    _buf_putb(buf, o1, b);
+    _buf_putb(buf, o2, c);
+}
+
+# --- Init month & day-of-week name tables ------------------------------------
+func _init_month_table() {
+    if (_MON_INIT != 0) { return; }
+    _MON_INIT = 1;
+
+    # Months 1-12, each 4 bytes (3 chars + space), stored at offsets 0,4,8,...44
+    _buf_puts3(_MON_TBL,  0, 74, 97, 110);  # Jan
+    _buf_puts3(_MON_TBL,  4, 70,101, 98);   # Feb
+    _buf_puts3(_MON_TBL,  8, 77, 97,114);   # Mar
+    _buf_puts3(_MON_TBL, 12, 65,112,114);   # Apr
+    _buf_puts3(_MON_TBL, 16, 77, 97,121);   # May
+    _buf_puts3(_MON_TBL, 20, 74,117,110);   # Jun
+    _buf_puts3(_MON_TBL, 24, 74,117,108);   # Jul
+    _buf_puts3(_MON_TBL, 28, 65,117,103);   # Aug
+    _buf_puts3(_MON_TBL, 32, 83,101,112);   # Sep
+    _buf_puts3(_MON_TBL, 36, 79, 99,116);   # Oct
+    _buf_puts3(_MON_TBL, 40, 78,111,118);   # Nov
+    _buf_puts3(_MON_TBL, 44, 68,101, 99);   # Dec
+
+    # Day of week: RTC wday 1=Sun..7=Sat, each 3 chars at offsets 0,3,6,...18
+    _buf_puts3(_DOW_TBL,  0, 83,117,110);   # Sun
+    _buf_puts3(_DOW_TBL,  3, 77,111,110);   # Mon
+    _buf_puts3(_DOW_TBL,  6, 84,117,101);   # Tue
+    _buf_puts3(_DOW_TBL,  9, 87,101,100);   # Wed
+    _buf_puts3(_DOW_TBL, 12, 84,104,117);   # Thu
+    _buf_puts3(_DOW_TBL, 15, 70,114,105);   # Fri
+    _buf_puts3(_DOW_TBL, 18, 83, 97,116);   # Sat
+}
+
+# --- Build clock string into _CLK_BUF: "HH:MM:SS  DD Mon YYYY" -------------
+# Format: [0..1]=HH [2]=: [3..4]=MM [5]=: [6..7]=SS [8..9]=sp
+#         [10..11]=DD [12]=sp [13..15]=Mon [16]=sp [17..20]=YYYY [21]=\0
+func _build_clock_str() {
+    _init_month_table();
+    rtc::rtc_read_time();
+
+    var h  = rtc::rtc_get_hour();
+    var mn = rtc::rtc_get_min();
+    var s  = rtc::rtc_get_sec();
+    var d  = rtc::rtc_get_day();
+    var mo = rtc::rtc_get_mon();
+    var yr = rtc::rtc_get_year();
+    var ct = rtc::rtc_get_cent();
+    var wd = rtc::rtc_get_wday();
+
+    var buf = _CLK_BUF;
+
+    # HH:MM:SS
+    rtc::rtc_write_digits(h,  buf, 0);
+    _buf_putb(buf, 2, 58);  # ':'
+    rtc::rtc_write_digits(mn, buf, 3);
+    _buf_putb(buf, 5, 58);  # ':'
+    rtc::rtc_write_digits(s,  buf, 6);
+
+    # Two spaces
+    _buf_putb(buf, 8, 32);
+    _buf_putb(buf, 9, 32);
+
+    # DD
+    rtc::rtc_write_digits(d, buf, 10);
+    _buf_putb(buf, 12, 32);  # space
+
+    # Mon (3 chars from _MON_TBL)
+    var mo_safe = mo;
+    if (mo_safe < 1)  { mo_safe = 1; }
+    if (mo_safe > 12) { mo_safe = 12; }
+    var mo_off: u32 = 0;
+    asm("movl %1, %0\n\t" "subl $1, %0\n\t" "imull $4, %0\n\t" : "=r"(mo_off) : "r"(mo_safe as u32));
+    var ma = _buf_getb(_MON_TBL, mo_off);
+    var mo_off1: u32 = 0; asm("movl %1, %0\n\t" "addl $1, %0\n\t" : "=r"(mo_off1) : "r"(mo_off));
+    var mo_off2: u32 = 0; asm("movl %1, %0\n\t" "addl $2, %0\n\t" : "=r"(mo_off2) : "r"(mo_off));
+    var mb = _buf_getb(_MON_TBL, mo_off1);
+    var mc = _buf_getb(_MON_TBL, mo_off2);
+    _buf_putb(buf, 13, ma);
+    _buf_putb(buf, 14, mb);
+    _buf_putb(buf, 15, mc);
+    _buf_putb(buf, 16, 32);  # space
+
+    # YYYY = cent * 100 + year
+    # Compute century digits
+    rtc::rtc_write_digits(ct, buf, 17);
+    rtc::rtc_write_digits(yr, buf, 19);
+
+    _buf_putb(buf, 21, 0);  # null terminator
+}
+
+# --- Draw top taskbar with live RTC clock ------------------------------------
 func gui_draw_taskbar() {
     var w = fb::fb_get_width();
 
-    # Taskbar background
     fb::fb_fill_rect(0, 0, w, TASKBAR_H, C_MANTLE);
-
-    # Bottom border
     fb::fb_draw_hline(0, TASKBAR_H - 1, w, C_SURFACE);
-
-    # Logo text "Navi OS"
     font::font_draw_string("Navi OS", 8, 6, C_MAUVE, C_MANTLE);
-
-    # Separator
     fb::fb_draw_vline(80, 4, TASKBAR_H - 8, C_SURFACE);
 
-    # Date/time placeholder
-    font::font_draw_string("00:00  Mon 01 Jan", w - 144, 6, C_OVERLAY, C_MANTLE);
+    # Build and draw live clock
+    _build_clock_str();
+    # Clock string is 21 chars * 8px wide = 168px; place at right edge
+    var clk_x: u32 = 0;
+    asm("movl %1, %0\n\t" "subl $170, %0\n\t" : "=r"(clk_x) : "r"(w));
+    font::font_draw_string(_CLK_BUF, clk_x, 6, C_TEXT, C_MANTLE);
 }
 
-# ─── Draw bottom dock ──────────────────────────────────────────────────────────
+# --- Draw bottom dock ---------------------------------------------------------
 func gui_draw_dock() {
     var w = fb::fb_get_width();
     var h = fb::fb_get_height();
     var dock_y: u32 = 0;
     asm("movl %1, %0\n\t" "subl %2, %0\n\t" : "=r"(dock_y) : "r"(h), "r"(DOCK_H));
 
-    # Dock background
     fb::fb_fill_rect(0, dock_y, w, DOCK_H, C_MANTLE);
     fb::fb_draw_hline(0, dock_y, w, C_SURFACE);
 
-    # Dock icons (drawn as colored squares with labels)
-    var icons_x: u32 = 8;
-    var icon_size: u32 = 36;
-    var icon_y: u32 = 0;
-    asm("movl %1, %0\n\t" "addl $6, %0\n\t" : "=r"(icon_y) : "r"(dock_y));
+    var icon_y: u32 = dock_y;
+    fb::fb_draw_image(8,   icon_y, _get_term());
+    fb::fb_draw_image(72,  icon_y, _get_file());
+    fb::fb_draw_image(136, icon_y, _get_set());
 
-    # Terminal icon (blue)
-    fb::fb_fill_rect(icons_x,        icon_y, icon_size, icon_size, C_BLUE);
-    font::font_draw_string(">_", icons_x + 10, icon_y + 12, C_MANTLE, C_BLUE);
-
-    # Files icon (yellow)
-    fb::fb_fill_rect(icons_x + 44,   icon_y, icon_size, icon_size, C_YELLOW);
-    font::font_draw_string("FM", icons_x + 54, icon_y + 12, C_MANTLE, C_YELLOW);
-
-    # Notepad icon (green)
-    fb::fb_fill_rect(icons_x + 88,   icon_y, icon_size, icon_size, C_GREEN);
-    font::font_draw_string("NP", icons_x + 98, icon_y + 12, C_MANTLE, C_GREEN);
-
-    # Settings icon (mauve)
-    fb::fb_fill_rect(icons_x + 132,  icon_y, icon_size, icon_size, C_MAUVE);
-    font::font_draw_string("ST", icons_x + 142, icon_y + 12, C_MANTLE, C_MAUVE);
+    # Icon labels
+    var label_y: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $36, %0\n\t" : "=r"(label_y) : "r"(dock_y));
+    font::font_draw_string("Terminal", 4,   label_y, C_OVERLAY, C_MANTLE);
+    font::font_draw_string("Files",    68,  label_y, C_OVERLAY, C_MANTLE);
+    font::font_draw_string("Settings", 128, label_y, C_OVERLAY, C_MANTLE);
 }
 
-# ─── Draw wallpaper (gradient) ────────────────────────────────────────────────
+# --- Draw wallpaper (gradient) -----------------------------------------------
 func gui_draw_wallpaper() {
     var w = fb::fb_get_width();
     var h = fb::fb_get_height();
@@ -101,12 +197,9 @@ func gui_draw_wallpaper() {
     asm("movl %1, %0\n\t" "subl %2, %0\n\t" "subl %3, %0\n\t"
         : "=r"(content_h) : "r"(h), "r"(TASKBAR_H), "r"(DOCK_H));
 
-    # Simple vertical gradient from C_BASE to a slightly lighter shade
     var row: u32 = 0;
     while (row < content_h) {
-        # Blend factor: 0..255 as row goes top to bottom
         var blend: u32 = (row * 40) / content_h;
-        # Base color 0x1E1E2E — add blend to each channel slightly
         var r: u32 = 0x1E + blend;
         var g: u32 = 0x1E + blend;
         var b: u32 = 0x2E + (blend * 2);
@@ -116,38 +209,210 @@ func gui_draw_wallpaper() {
         var color: u32 = 0;
         asm("movl %1, %0\n\t" "shll $16, %0\n\t" "orl %2, %0\n\t" "shll $8, %0\n\t" "orl %3, %0\n\t"
             : "=r"(color) : "r"(r), "r"(g), "r"(b));
-
         fb::fb_draw_hline(0, content_y + row, w, color);
         row += 1;
     }
 }
 
-# ─── Draw a window frame ───────────────────────────────────────────────────────
+# --- Draw a window frame ------------------------------------------------------
 func gui_draw_window(x: u32, y: u32, w: u32, h: u32, title: *u8) {
-    # Window body
     fb::fb_fill_rect(x, y, w, h, C_BASE);
-
-    # Title bar
     fb::fb_fill_rect(x, y, w, 24, C_SURFACE);
-
-    # Title bar border
     fb::fb_draw_hline(x, y + 24, w, C_OVERLAY);
-
-    # Window border
     fb::fb_draw_rect(x, y, w, h, C_SURFACE);
-
-    # Title text
     font::font_draw_string(title, x + 8, y + 4, C_TEXT, C_SURFACE);
-
-    # Close button (red dot at top-right)
-    fb::fb_fill_rect(x + w - 18, y + 6, 12, 12, C_RED);
+    fb::fb_draw_image(x + w - 20, y + 4, _get_close());
+    fb::fb_draw_image(x + w - 40, y + 4, _get_max());
+    fb::fb_draw_image(x + w - 60, y + 4, _get_min());
 }
 
-# ─── Draw Terminal window ──────────────────────────────────────────────────────
+# --- Draw a single row in a terminal output area -----------------------------
+# row_buf: ptr to null-terminated string, tx/ty: top-left of that row
+func gui_draw_term_row(row_buf: *u8, tx: u32, ty: u32, fg: u32) {
+    font::font_draw_string(row_buf, tx, ty, fg, C_MANTLE);
+}
+
+# --- GUI Terminal App (interactive) ------------------------------------------
+# Output buffer: 30 rows x 80 cols chars at 0x01920000
+var TERM_ROWS:   u32 = 26;
+var TERM_COLS:   u32 = 80;
+var TERM_BUF:    *u8 = 0x01920000;   # 30*80 = 2400 bytes
+var TERM_INPUT:  *u8 = 0x01920A00;   # 128-byte input line buffer
+var TERM_CURSOR_ROW: u32 = 0;
+var TERM_CURSOR_COL: u32 = 0;
+
+# Clear terminal buffer
+func gui_term_clear() {
+    var i: u32 = 0;
+    var total: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(total) : "r"(TERM_ROWS), "r"(TERM_COLS));
+    while (i < total) {
+        _buf_putb(TERM_BUF, i, 32);  # space
+        i += 1;
+    }
+    TERM_CURSOR_ROW = 0;
+    TERM_CURSOR_COL = 0;
+}
+
+# Scroll terminal up one line
+func gui_term_scroll() {
+    var row: u32 = 0;
+    while (row < TERM_ROWS - 1) {
+        var dst_off: u32 = 0;
+        var src_off: u32 = 0;
+        asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(dst_off) : "r"(row), "r"(TERM_COLS));
+        var next_row: u32 = 0;
+        asm("movl %1, %0\n\t" "addl $1, %0\n\t" : "=r"(next_row) : "r"(row));
+        asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(src_off) : "r"(next_row), "r"(TERM_COLS));
+        var col: u32 = 0;
+        while (col < TERM_COLS) {
+            var src_idx: u32 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(src_idx) : "r"(src_off), "r"(col));
+            var dst_idx: u32 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(dst_idx) : "r"(dst_off), "r"(col));
+            var c = _buf_getb(TERM_BUF, src_idx);
+            _buf_putb(TERM_BUF, dst_idx, c);
+            col += 1;
+        }
+        row += 1;
+    }
+    # Clear last row
+    var last_off: u32 = 0;
+    asm("movl %1, %0\n\t" "subl $1, %0\n\t" "imull %2, %0\n\t" : "=r"(last_off) : "r"(TERM_ROWS), "r"(TERM_COLS));
+    var col: u32 = 0;
+    while (col < TERM_COLS) {
+        var idx: u32 = 0;
+        asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(last_off), "r"(col));
+        _buf_putb(TERM_BUF, idx, 32);
+        col += 1;
+    }
+}
+
+# Print a char to the terminal buffer (handles newline + scroll)
+func gui_term_putch(c: u8) {
+    if (c == 10 || c == 13) {  # newline
+        # Pad rest of row with spaces
+        while (TERM_CURSOR_COL < TERM_COLS) {
+            var idx: u32 = 0;
+            asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+                : "=r"(idx) : "r"(TERM_CURSOR_ROW), "r"(TERM_COLS), "r"(TERM_CURSOR_COL));
+            _buf_putb(TERM_BUF, idx, 32);
+            TERM_CURSOR_COL += 1;
+        }
+        TERM_CURSOR_COL = 0;
+        TERM_CURSOR_ROW += 1;
+        if (TERM_CURSOR_ROW >= TERM_ROWS) {
+            gui_term_scroll();
+            TERM_CURSOR_ROW = TERM_ROWS - 1;
+        }
+        return;
+    }
+    if (c == 8) {  # backspace
+        if (TERM_CURSOR_COL > 0) {
+            TERM_CURSOR_COL -= 1;
+            var idx: u32 = 0;
+            asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+                : "=r"(idx) : "r"(TERM_CURSOR_ROW), "r"(TERM_COLS), "r"(TERM_CURSOR_COL));
+            _buf_putb(TERM_BUF, idx, 32);
+        }
+        return;
+    }
+    if (TERM_CURSOR_COL >= TERM_COLS) {
+        TERM_CURSOR_COL = 0;
+        TERM_CURSOR_ROW += 1;
+        if (TERM_CURSOR_ROW >= TERM_ROWS) {
+            gui_term_scroll();
+            TERM_CURSOR_ROW = TERM_ROWS - 1;
+        }
+    }
+    var idx: u32 = 0;
+    asm("movl %1, %0\n\t" "imull %2, %0\n\t" "addl %3, %0\n\t"
+        : "=r"(idx) : "r"(TERM_CURSOR_ROW), "r"(TERM_COLS), "r"(TERM_CURSOR_COL));
+    _buf_putb(TERM_BUF, idx, c);
+    TERM_CURSOR_COL += 1;
+}
+
+# Print a null-terminated string to terminal buffer
+func gui_term_print(s: *u8) {
+    var i: u32 = 0;
+    while (true) {
+        var c = _buf_getb(s, i);
+        if (c == 0) { break; }
+        gui_term_putch(c);
+        i += 1;
+    }
+}
+
+# Print a u32 number to terminal
+func gui_term_print_u32(v: u32) {
+    if (v == 0) { gui_term_putch(48); return; }
+    # Build digits in reverse into a small stack buffer at 0x01920C00
+    var dbuf: *u8 = 0x01920C00;
+    var len: u32 = 0;
+    var n = v;
+    while (n > 0) {
+        var digit: u32 = n - ((n / 10) * 10);
+        var dc: u8 = (digit as u8) + 48;
+        _buf_putb(dbuf, len, dc);
+        len += 1;
+        n = n / 10;
+    }
+    # Print in reverse order
+    var i = len;
+    while (i > 0) {
+        i -= 1;
+        var c = _buf_getb(dbuf, i);
+        gui_term_putch(c);
+    }
+}
+
+# Render the terminal buffer to the screen (inside the window)
+func gui_term_redraw(win_x: u32, win_y: u32, win_w: u32, win_h: u32) {
+    # Content area starts at win_y + 25 (after title bar)
+    var cx: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $6, %0\n\t" : "=r"(cx) : "r"(win_x));
+    var cy: u32 = 0;
+    asm("movl %1, %0\n\t" "addl $28, %0\n\t" : "=r"(cy) : "r"(win_y));
+
+    fb::fb_fill_rect(win_x + 1, win_y + 25, win_w - 2, win_h - 26, C_MANTLE);
+
+    var row: u32 = 0;
+    while (row < TERM_ROWS) {
+        var row_off: u32 = 0;
+        asm("movl %1, %0\n\t" "imull %2, %0\n\t" : "=r"(row_off) : "r"(row), "r"(TERM_COLS));
+
+        var ty: u32 = 0;
+        asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(ty) : "r"(cy), "r"(row));
+        ty += row;  # add row * 0 but we need row * FONT_HEIGHT
+        # ty = cy + row * 16
+        asm("movl %1, %0\n\t" "imull $16, %1\n\t" "addl %1, %0\n\t"
+            : "=r"(ty) : "r"(row), "r"(cy));
+
+        var col: u32 = 0;
+        while (col < TERM_COLS) {
+            var idx: u32 = 0;
+            asm("movl %1, %0\n\t" "addl %2, %0\n\t" : "=r"(idx) : "r"(row_off), "r"(col));
+            var c = _buf_getb(TERM_BUF, idx);
+
+            var tx: u32 = 0;
+            asm("movl %1, %0\n\t" "imull $8, %0\n\t" "addl %2, %0\n\t" : "=r"(tx) : "r"(col), "r"(cx));
+
+            var fg_color: u32 = C_TEXT;
+            if (row == TERM_CURSOR_ROW && col == TERM_CURSOR_COL) {
+                fg_color = C_BASE;
+                fb::fb_fill_rect(tx, ty, 8, 16, C_TEXT);  # block cursor
+            }
+            font::font_draw_char(c, tx, ty, fg_color, C_MANTLE);
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+# --- Draw initial (static) terminal window for desktop render -----------------
 func gui_draw_terminal() {
     var w = fb::fb_get_width();
     var h = fb::fb_get_height();
-
     var win_x: u32 = 40;
     var win_y: u32 = 40;
     var win_w: u32 = 0;
@@ -155,22 +420,17 @@ func gui_draw_terminal() {
     asm("movl %1, %0\n\t" "subl $80, %0\n\t"  : "=r"(win_w) : "r"(w));
     asm("movl %1, %0\n\t" "subl $120, %0\n\t" : "=r"(win_h) : "r"(h));
 
-    gui_draw_window(win_x, win_y, win_w, win_h, "Terminal — Navi OS");
-
-    # Terminal content area background
+    gui_draw_window(win_x, win_y, win_w, win_h, "Terminal -- Navi OS");
     fb::fb_fill_rect(win_x + 1, win_y + 25, win_w - 2, win_h - 26, C_MANTLE);
-
-    # Draw some fake terminal lines
-    font::font_draw_string("Welcome to Navi OS v1.0", win_x + 8, win_y + 32, C_GREEN, C_MANTLE);
-    font::font_draw_string("Type 'help' for commands.", win_x + 8, win_y + 50, C_TEXT, C_MANTLE);
+    font::font_draw_string("Welcome to Navi OS", win_x + 8, win_y + 32, C_GREEN, C_MANTLE);
+    font::font_draw_string("Click the terminal icon to open an interactive shell.", win_x + 8, win_y + 50, C_TEXT, C_MANTLE);
     font::font_draw_string("root@navi:/> _", win_x + 8, win_y + 76, C_BLUE, C_MANTLE);
 }
 
-# ─── Full desktop render ───────────────────────────────────────────────────────
+# --- Full desktop render ------------------------------------------------------
 func gui_render_desktop() {
     if (fb::fb_is_active() == 0) {
-        io::print("[GUI] No framebuffer available. Run in VBE mode.\n");
-        io::print("[GUI] Add 'set gfxmode 1024x768x32' to grub.cfg and rebuild.\n");
+        io::print("[GUI] No framebuffer. Boot with VBE mode.\n");
         return;
     }
 
@@ -179,10 +439,27 @@ func gui_render_desktop() {
     gui_draw_taskbar();
     gui_draw_dock();
     gui_draw_terminal();
+
+    fb::fb_swap_buffers();
+
+    var mx: u32 = mouse::get_mouse_x();
+    var my: u32 = mouse::get_mouse_y();
+    fb::fb_draw_image_vram(mx, my, _get_cursor());
 }
 
-# ─── Initialize GUI subsystem ─────────────────────────────────────────────────
+# --- Fast mouse update --------------------------------------------------------
+func gui_update_mouse(ox: u32, oy: u32, nx: u32, ny: u32) {
+    fb::fb_restore_rect(ox, oy, 24, 24);
+    fb::fb_draw_image_vram(nx, ny, _get_cursor());
+}
+
+# --- Initialize GUI subsystem -------------------------------------------------
 func init_gui() {
     font::init_font();
-    io::print("[GUI] Font engine initialized.\n");
+    gui_term_clear();
+    gui_term_print("Navi OS GUI Terminal\n");
+    gui_term_print("Type commands, press Enter.\n");
+    gui_term_print("Type 'exit' to return to desktop.\n");
+    gui_term_print("root@navi:/> ");
+    io::print("[GUI] Font + terminal buffer initialized.\n");
 }
